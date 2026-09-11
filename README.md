@@ -18,31 +18,59 @@ writes the same on-disk index format.
 
 ## This fork
 
-Same tool, same on-disk format, same lookups — building and sorting are just a lot
-faster, and `create` can ingest a whole folder. Every new output is byte-identical to
-the original's, so indexes and lookups are unaffected. Figures below are on a real
-57.4M-word dictionary, 8 cores.
+This fork keeps the same on-disk index format and lookup path, but speeds up index
+creation and replaces the seek-heavy out-of-core quicksort with an external merge
+sort. It also adds whole-folder ingest to `create`.
 
-- **Parallel indexing.** `create` memory-maps the wordlist and parses *and* hashes
-  across every core instead of one at a time:
+### Measured performance
 
-  | `create` | original | this fork |
-  | --- | --- | --- |
-  | NTLM | 16.0s | **2.4s (6.6×)** |
-  | md5  | ~14s  | **~1.9s (7.5×)** |
+The figures below are from release builds of upstream commit `066dce2` and this
+fork's performance code at `0df4d21`, run on the same Intel Core i5-14600T system
+(20 logical CPUs, 32 GiB RAM, NVMe storage).
 
-- **External-merge sort.** The out-of-core sort used to do a disk seek per entry; it
-  now generates sorted runs and k-way merges them with sequential I/O. A 2M-entry index
-  at a 1 MiB budget goes **151.5s → 0.34s (446×)**, and the gap only widens with size —
-  the 57M index above sorts in **7.0s** here. (An index that exceeds the memory budget
-  is merged through a scratch file about its own size, then renamed over it; one that
-  fits the budget is still sorted in place with no scratch.)
+The corpus is FrequencyWords' English OpenSubtitles-derived `en_full.txt`:
+1,656,996 lines / 19,977,552 bytes, SHA-256
+`7fea67ab954e2c01df6c608c9826e594cf36f8823b3243554f88245fb75dc506`.
+It is available from
+https://github.com/hermitdave/FrequencyWords/blob/master/content/2018/en/en_full.txt.
+The resulting index is about 23 MiB.
 
-- **Folder ingest.** `create --dir <folder>` indexes a whole folder in one command,
-  with `--mode combined` (concatenate into one index) or `--mode separate` (one index
-  per file plus a generated `tables.toml` for `lookup --config`).
+| workload | upstream | this fork | result |
+| --- | ---: | ---: | ---: |
+| `create` MD5 | 290.3 ms | **34.0 ms** | **8.53× faster** |
+| `create` NTLM | 263.1 ms | **36.8 ms** | **7.14× faster** |
+| sort, 2 GiB budget | 95.6 ms | 88.1 ms | effectively unchanged |
+| sort, 4 MiB budget | 13.088 s | **0.189 s** | **69.2× faster** |
+| sort, 1 MiB budget | 21.461 s | **0.291 s** | **73.7× faster** |
+| 4-hash lookup batch | **3.627 ms** | 3.715 ms | effectively unchanged |
 
-- **Lookup is unchanged** — no lookup code was touched, and it measures flat.
+`create` results are medians of 10 alternating runs per algorithm. The 2 GiB sort
+result is the median of 20 alternating runs; the 4 MiB and 1 MiB results are medians
+of three runs each. Lookup is the median of 40 alternating runs using three known
+hits (from the beginning, middle, and end of the corpus) plus one guaranteed miss.
+
+The sort numbers need context: when the whole index fits the configured memory
+budget, both versions sort in memory and performance is essentially the same. The
+large improvement appears when the index exceeds that budget. Upstream then performs
+file-based quicksort with per-entry seeks; this fork generates sorted runs and k-way
+merges them using sequential I/O. The external merge needs scratch space roughly the
+size of the index beside the index file.
+
+For this corpus, MD5 and NTLM indexes produced by both versions were byte-for-byte
+identical before sorting, the sorted MD5 indexes were also byte-for-byte identical,
+and the tested lookups returned identical results.
+
+- **Parallel indexing.** `create` memory-maps the wordlist and parses and hashes
+  line-aligned windows across the available CPUs while preserving deterministic
+  output order.
+- **External-merge sort.** Oversized indexes are sorted as bounded in-memory runs
+  and merged with sequential I/O rather than seek-heavy file quicksort.
+- **Folder ingest.** `create --dir <folder>` supports `--mode combined` (one
+  concatenated dictionary/index) and `--mode separate` (one index per file plus a
+  generated `tables.toml`). Separate mode validates all intended outputs before
+  writing so an index or config cannot overwrite another input/output.
+- **Lookup is unchanged.** No lookup code was modified; measured lookup performance
+  is flat within process/filesystem noise.
 
 Install this fork's CLI with:
 
