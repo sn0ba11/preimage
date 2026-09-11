@@ -234,7 +234,11 @@ fn cmd_create(args: CreateArgs) -> Result<()> {
             if files.is_empty() {
                 bail!("no files found in {}", dir.display());
             }
-            println!("Found {} wordlist file(s) in {}.", files.len(), dir.display());
+            println!(
+                "Found {} wordlist file(s) in {}.",
+                files.len(),
+                dir.display()
+            );
             match args.mode {
                 DirMode::Combined => {
                     let output = args.output.as_ref().ok_or_else(|| {
@@ -332,6 +336,9 @@ fn create_separate(
 ) -> Result<()> {
     std::fs::create_dir_all(out_dir)?;
 
+    // Plan every output before opening any of them. This prevents an output for one
+    // wordlist (for example `foo.idx`) from truncating another input file with that
+    // name, and prevents the config path from colliding with either an input or index.
     let mut tables = Vec::with_capacity(files.len());
     for f in files {
         let name = f
@@ -339,22 +346,24 @@ fn create_separate(
             .ok_or_else(|| anyhow::anyhow!("wordlist path has no file name: {}", f.display()))?
             .to_string_lossy()
             .into_owned();
-        let index_path = out_dir.join(format!("{name}.idx"));
-        if same_existing_path(f, &index_path) {
-            bail!("the index for {name} would overwrite the wordlist itself");
-        }
-
-        println!("Indexing {} -> {}", f.display(), index_path.display());
-        let pb = create_progress_bar();
-        IndexFile::build(algorithm, f, &index_path, Some(&pb))?;
-        pb.finish_and_clear();
-
         tables.push(TableConfig {
-            label: name,
+            label: name.clone(),
             algorithm: algorithm_name.to_string(),
-            index: index_path,
+            index: out_dir.join(format!("{name}.idx")),
             dictionary: f.clone(),
         });
+    }
+    validate_separate_paths(files, &tables, config_path)?;
+
+    for table in &tables {
+        println!(
+            "Indexing {} -> {}",
+            table.dictionary.display(),
+            table.index.display()
+        );
+        let pb = create_progress_bar();
+        IndexFile::build(algorithm, &table.dictionary, &table.index, Some(&pb))?;
+        pb.finish_and_clear();
     }
 
     let config = Config { table: tables };
@@ -370,7 +379,62 @@ fn create_separate(
     for table in &config.table {
         println!("  preimage sort {}", table.index.display());
     }
-    println!("Then: preimage lookup --config {} <hash>", config_path.display());
+    println!(
+        "Then: preimage lookup --config {} <hash>",
+        config_path.display()
+    );
+    Ok(())
+}
+
+/// Refuse a separate-mode plan if any generated file aliases an input or another
+/// generated file. Validation happens before the first index is opened for writing.
+fn validate_separate_paths(
+    files: &[PathBuf],
+    tables: &[TableConfig],
+    config_path: &Path,
+) -> Result<()> {
+    for table in tables {
+        for input in files {
+            if same_target_path(input, &table.index)? {
+                bail!(
+                    "generated index {} would overwrite input wordlist {}",
+                    table.index.display(),
+                    input.display()
+                );
+            }
+        }
+
+        if same_target_path(&table.index, config_path)? {
+            bail!(
+                "config path {} would overwrite generated index {}",
+                config_path.display(),
+                table.index.display()
+            );
+        }
+    }
+
+    for input in files {
+        if same_target_path(input, config_path)? {
+            bail!(
+                "config path {} would overwrite input wordlist {}",
+                config_path.display(),
+                input.display()
+            );
+        }
+    }
+
+    for (i, left) in tables.iter().enumerate() {
+        for right in &tables[i + 1..] {
+            if same_target_path(&left.index, &right.index)? {
+                bail!(
+                    "generated indexes {} and {} resolve to the same output file",
+                    left.index.display(),
+                    right.index.display()
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -417,10 +481,46 @@ fn concatenate_files(files: &[PathBuf], out_path: &Path) -> Result<()> {
 /// Whether `a` and `b` resolve to the same existing file. Paths that do not exist yet
 /// (the usual case for an output) cannot alias one that does, so they answer `false`.
 fn same_existing_path(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a_meta), Ok(b_meta)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            if a_meta.dev() == b_meta.dev() && a_meta.ino() == b_meta.ino() {
+                return true;
+            }
+        }
+    }
+
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     }
+}
+
+/// Compare two paths as eventual output targets, even if one does not exist yet.
+/// Existing files use their canonical identity (and inode on Unix); non-existent
+/// paths canonicalize their parent directory and append the final path component.
+fn same_target_path(a: &Path, b: &Path) -> Result<bool> {
+    if same_existing_path(a, b) {
+        return Ok(true);
+    }
+
+    fn target_path(path: &Path) -> Result<PathBuf> {
+        if path.exists() {
+            return Ok(path.canonicalize()?);
+        }
+
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("output path has no file name: {}", path.display()))?;
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        Ok(parent.canonicalize()?.join(name))
+    }
+
+    Ok(target_path(a)? == target_path(b)?)
 }
 
 fn cmd_sort(memory_bytes: usize, ram_only: bool, index_path: &PathBuf) -> Result<()> {
@@ -639,6 +739,68 @@ mod tests {
         assert_eq!(
             std::fs::read(&out).expect("read"),
             b"one\ntwo\nthree\nfour\nfive\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn separate_mode_refuses_an_index_that_would_overwrite_another_input() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let foo = dir.path().join("foo");
+        let foo_idx = dir.path().join("foo.idx");
+        std::fs::write(&foo, b"alpha\n").expect("write foo");
+        std::fs::write(&foo_idx, b"DO NOT OVERWRITE\n").expect("write foo.idx");
+        let original = std::fs::read(&foo_idx).expect("read original");
+        let config = dir.path().join("tables.toml");
+
+        let error = create_separate(
+            "md5",
+            algorithm_from_name("md5"),
+            &[foo, foo_idx.clone()],
+            dir.path(),
+            &config,
+        )
+        .expect_err("an index output must not overwrite another input file");
+
+        assert!(
+            error.to_string().contains("would overwrite input wordlist"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&foo_idx).expect("read after refusal"),
+            original,
+            "validation must happen before any input is truncated"
+        );
+        assert!(!config.exists(), "config must not be written after refusal");
+    }
+
+    #[test]
+    fn separate_mode_refuses_a_config_that_collides_with_an_index() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source_dir = dir.path().join("words");
+        let out_dir = dir.path().join("idx");
+        std::fs::create_dir(&source_dir).expect("source dir");
+        let words = source_dir.join("words.txt");
+        std::fs::write(&words, b"alpha\n").expect("write words");
+        let config = out_dir.join("words.txt.idx");
+
+        let error = create_separate(
+            "md5",
+            algorithm_from_name("md5"),
+            &[words],
+            &out_dir,
+            &config,
+        )
+        .expect_err("config must not share a generated index path");
+
+        assert!(
+            error
+                .to_string()
+                .contains("would overwrite generated index"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !config.exists(),
+            "validation must happen before the colliding output is created"
         );
     }
 
