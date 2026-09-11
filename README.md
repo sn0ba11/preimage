@@ -90,8 +90,34 @@ scratch file. As the warning says, do not interrupt a sort: the run-generation p
 rewrites the file in place, so an interrupted or failed sort (out of disk, for
 instance) can leave it partially sorted and in need of a rebuild.
 
+### Indexing a folder
+
+`create --dir <folder>` indexes every file in a folder (sorted by name, for a
+reproducible result) in one command. Two modes, because a lookup is a binary
+search over one index — searching *N* separate indexes costs *N* of them:
+
+```bash
+# Combined: concatenate the folder into one dictionary and build one index over
+# it. One binary search per lookup; rebuild the whole thing to add a file.
+preimage create -a md5 --dir words/ --mode combined -o all.idx --dict all.txt
+preimage sort all.idx
+preimage lookup -a md5 -i all.idx -d all.txt <hash>
+
+# Separate: one index per file, plus a generated config. Lookups search every
+# table; add a file later without rebuilding the others.
+preimage create -a md5 --dir words/ --mode separate --out-dir idx/ --config tables.toml
+# sort each idx/*.idx, then:
+preimage lookup --config tables.toml <hash>
+```
+
+Prefer `combined` unless the set of wordlists changes often: one index is the
+fastest to search and matches the single-dictionary format. `combined` writes a
+concatenated dictionary (with a newline inserted between files so words never
+merge) that becomes the dictionary the positions point into, so keep it.
+
 To search several tables at once, describe them in a config file and use
-`preimage lookup --config tables.toml <hash>...`:
+`preimage lookup --config tables.toml <hash>...` — this is also what
+`--mode separate` writes for you:
 
 ```toml
 [[table]]

@@ -1,8 +1,10 @@
+use std::fs::File;
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use preimage::{
@@ -66,21 +68,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Create an unsorted index from a wordlist
-    #[command(after_help = "\
-EXAMPLE:
-  preimage create -a md5 -w wordlist.txt -o md5.idx")]
-    Create {
-        /// Hash algorithm name (run 'preimage list' to list)
-        #[arg(short, long)]
-        algorithm: String,
-        /// Path to the wordlist file
-        #[arg(short, long)]
-        wordlist: PathBuf,
-        /// Path to the output index file
-        #[arg(short, long)]
-        output: PathBuf,
-    },
+    /// Create an unsorted index from a wordlist, or a folder of wordlists
+    Create(CreateArgs),
     /// Sort an index file in-place (DO NOT INTERRUPT)
     #[command(after_help = "\
 WARNING: Sorting modifies the file in-place. Do NOT interrupt the process \
@@ -126,6 +115,55 @@ EXAMPLE:
     List,
 }
 
+/// How to ingest a `--dir` of wordlists.
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum DirMode {
+    /// Concatenate every file into one dictionary and build a single index over it.
+    /// One binary search per lookup; rebuild the whole thing to add a file.
+    Combined,
+    /// Build one index per file and write a config listing them all. Lookups search
+    /// every table; add a file without rebuilding the others.
+    Separate,
+}
+
+#[derive(clap::Args)]
+#[command(after_help = "\
+EXAMPLES:
+  One wordlist:
+    preimage create -a md5 -w wordlist.txt -o md5.idx
+
+  A folder, combined into one index (one dictionary, fastest lookups):
+    preimage create -a md5 --dir words/ --mode combined -o all.idx --dict all.txt
+
+  A folder, one index per file (add files later without rebuilding):
+    preimage create -a md5 --dir words/ --mode separate --out-dir idx/ --config tables.toml")]
+struct CreateArgs {
+    /// Hash algorithm name (run 'preimage list' to list)
+    #[arg(short, long)]
+    algorithm: String,
+    /// Path to a single wordlist file (mutually exclusive with --dir)
+    #[arg(short, long)]
+    wordlist: Option<PathBuf>,
+    /// Path to a folder of wordlist files to ingest together
+    #[arg(long)]
+    dir: Option<PathBuf>,
+    /// With --dir: one combined index, or one index per file
+    #[arg(long, value_enum, default_value = "combined")]
+    mode: DirMode,
+    /// Output index path (single wordlist, or --dir --mode combined)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Where to write the concatenated dictionary (--dir --mode combined)
+    #[arg(long)]
+    dict: Option<PathBuf>,
+    /// Output directory for the per-file indexes (--dir --mode separate)
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
+    /// Config file to write, listing the per-file tables (--dir --mode separate)
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
 #[derive(clap::Args)]
 #[command(after_help = "\
 EXAMPLES:
@@ -158,11 +196,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Create {
-            algorithm,
-            wordlist,
-            output,
-        } => cmd_create(&algorithm, &wordlist, &output),
+        Commands::Create(args) => cmd_create(args),
         Commands::Sort { memory, ram, index } => cmd_sort(memory, ram, &index),
         Commands::Check { index } => cmd_check(&index),
         Commands::Lookup(args) => cmd_lookup(args),
@@ -178,9 +212,55 @@ fn algorithm_from_name(name: &str) -> &'static dyn HashAlgorithm {
     })
 }
 
-fn cmd_create(algorithm_name: &str, wordlist: &Path, output: &Path) -> Result<()> {
-    let algorithm = algorithm_from_name(algorithm_name);
+fn cmd_create(args: CreateArgs) -> Result<()> {
+    let algorithm = algorithm_from_name(&args.algorithm);
 
+    match (args.wordlist.as_ref(), args.dir.as_ref()) {
+        (Some(_), Some(_)) => {
+            bail!("pass either --wordlist <file> or --dir <folder>, not both")
+        }
+        (None, None) => {
+            bail!("pass --wordlist <file> to index one file, or --dir <folder> to index a folder")
+        }
+        (Some(wordlist), None) => {
+            let output = args
+                .output
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--output <index> is required with --wordlist"))?;
+            create_one(algorithm, wordlist, output)
+        }
+        (None, Some(dir)) => {
+            let files = list_wordlist_files(dir)?;
+            if files.is_empty() {
+                bail!("no files found in {}", dir.display());
+            }
+            println!("Found {} wordlist file(s) in {}.", files.len(), dir.display());
+            match args.mode {
+                DirMode::Combined => {
+                    let output = args.output.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("--output <index> is required for --mode combined")
+                    })?;
+                    let dict = args.dict.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("--dict <dictionary> is required for --mode combined")
+                    })?;
+                    create_combined(&args.algorithm, algorithm, &files, dict, output)
+                }
+                DirMode::Separate => {
+                    let out_dir = args.out_dir.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("--out-dir <dir> is required for --mode separate")
+                    })?;
+                    let config = args.config.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("--config <tables.toml> is required for --mode separate")
+                    })?;
+                    create_separate(&args.algorithm, algorithm, &files, out_dir, config)
+                }
+            }
+        }
+    }
+}
+
+/// A bytes-based progress bar matching the style `create` has always used.
+fn create_progress_bar() -> ProgressBar {
     let pb = ProgressBar::new(0);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -188,12 +268,159 @@ fn cmd_create(algorithm_name: &str, wordlist: &Path, output: &Path) -> Result<()
             .expect("valid template")
             .progress_chars("#>-"),
     );
+    pb
+}
 
+/// Index a single wordlist file — the original `create` behaviour.
+fn create_one(algorithm: &dyn HashAlgorithm, wordlist: &Path, output: &Path) -> Result<()> {
+    let pb = create_progress_bar();
     let index = IndexFile::build(algorithm, wordlist, output, Some(&pb))?;
     pb.finish_and_clear();
     let count = index.entry_count()?;
     println!("Index creation complete. {count} entries written.");
     Ok(())
+}
+
+/// Concatenate a folder into one dictionary and build a single index over it.
+fn create_combined(
+    algorithm_name: &str,
+    algorithm: &dyn HashAlgorithm,
+    files: &[PathBuf],
+    dict_path: &Path,
+    index_path: &Path,
+) -> Result<()> {
+    for f in files {
+        if same_existing_path(f, dict_path) || same_existing_path(f, index_path) {
+            bail!(
+                "the combined dictionary or index would overwrite an input file ({}); \
+                 write them outside the --dir folder",
+                f.display()
+            );
+        }
+    }
+
+    println!("Concatenating into {} ...", dict_path.display());
+    concatenate_files(files, dict_path)?;
+
+    let pb = create_progress_bar();
+    let index = IndexFile::build(algorithm, dict_path, index_path, Some(&pb))?;
+    pb.finish_and_clear();
+    let count = index.entry_count()?;
+
+    println!(
+        "Index creation complete. {count} entries written to {}.",
+        index_path.display()
+    );
+    println!("Next:");
+    println!("  preimage sort {}", index_path.display());
+    println!(
+        "  preimage lookup -a {} -i {} -d {} <hash>",
+        algorithm_name,
+        index_path.display(),
+        dict_path.display()
+    );
+    Ok(())
+}
+
+/// Build one index per file and write a config listing them for `lookup --config`.
+fn create_separate(
+    algorithm_name: &str,
+    algorithm: &dyn HashAlgorithm,
+    files: &[PathBuf],
+    out_dir: &Path,
+    config_path: &Path,
+) -> Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+
+    let mut tables = Vec::with_capacity(files.len());
+    for f in files {
+        let name = f
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("wordlist path has no file name: {}", f.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let index_path = out_dir.join(format!("{name}.idx"));
+        if same_existing_path(f, &index_path) {
+            bail!("the index for {name} would overwrite the wordlist itself");
+        }
+
+        println!("Indexing {} -> {}", f.display(), index_path.display());
+        let pb = create_progress_bar();
+        IndexFile::build(algorithm, f, &index_path, Some(&pb))?;
+        pb.finish_and_clear();
+
+        tables.push(TableConfig {
+            label: name,
+            algorithm: algorithm_name.to_string(),
+            index: index_path,
+            dictionary: f.clone(),
+        });
+    }
+
+    let config = Config { table: tables };
+    let rendered = toml::to_string_pretty(&config)?;
+    std::fs::write(config_path, rendered)?;
+
+    println!(
+        "Wrote {} table(s) to {}.",
+        config.table.len(),
+        config_path.display()
+    );
+    println!("Next — sort each index:");
+    for table in &config.table {
+        println!("  preimage sort {}", table.index.display());
+    }
+    println!("Then: preimage lookup --config {} <hash>", config_path.display());
+    Ok(())
+}
+
+/// The regular files directly inside `dir`, sorted by path for a deterministic,
+/// reproducible ingest order. Subdirectories are skipped.
+fn list_wordlist_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Concatenate `files` into `out_path`, guaranteeing a `\n` between files so the last
+/// word of one and the first word of the next do not merge into a single line.
+fn concatenate_files(files: &[PathBuf], out_path: &Path) -> Result<()> {
+    let mut out = BufWriter::new(File::create(out_path)?);
+    let mut buf = vec![0u8; 1 << 20];
+    for f in files {
+        let mut reader = File::open(f)?;
+        let mut last_byte = None;
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n])?;
+            last_byte = Some(buf[n - 1]);
+        }
+        // Only add a separator when the file was non-empty and did not end in one,
+        // so we neither merge words nor inject spurious empty lines.
+        if matches!(last_byte, Some(b) if b != b'\n') {
+            out.write_all(b"\n")?;
+        }
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// Whether `a` and `b` resolve to the same existing file. Paths that do not exist yet
+/// (the usual case for an output) cannot alias one that does, so they answer `false`.
+fn same_existing_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 fn cmd_sort(memory_bytes: usize, ram_only: bool, index_path: &PathBuf) -> Result<()> {
@@ -290,12 +517,12 @@ fn lookup_single(
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 struct Config {
     table: Vec<TableConfig>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 struct TableConfig {
     label: String,
     algorithm: String,
@@ -366,4 +593,72 @@ fn cmd_algorithms() -> Result<()> {
         println!("{name}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_wordlist_files_is_sorted_and_skips_subdirs() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("b.txt"), b"x").expect("write");
+        std::fs::write(dir.path().join("a.txt"), b"y").expect("write");
+        std::fs::write(dir.path().join("c.txt"), b"z").expect("write");
+        std::fs::create_dir(dir.path().join("nested")).expect("subdir");
+
+        let files = list_wordlist_files(dir.path()).expect("list");
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a.txt", "b.txt", "c.txt"],
+            "files must be returned sorted, with subdirectories skipped"
+        );
+    }
+
+    #[test]
+    fn concatenate_inserts_a_separator_only_when_one_is_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ends_nl = dir.path().join("a");
+        std::fs::write(&ends_nl, b"one\ntwo\n").expect("write");
+        let no_nl = dir.path().join("b");
+        std::fs::write(&no_nl, b"three\nfour").expect("write");
+        let empty = dir.path().join("c");
+        std::fs::write(&empty, b"").expect("write");
+        let also_nl = dir.path().join("d");
+        std::fs::write(&also_nl, b"five\n").expect("write");
+
+        let out = dir.path().join("combined.txt");
+        concatenate_files(&[ends_nl, no_nl, empty, also_nl], &out).expect("concat");
+
+        // A missing terminator is added (between "four" and "five"); existing ones are
+        // not doubled, and the empty file contributes nothing.
+        assert_eq!(
+            std::fs::read(&out).expect("read"),
+            b"one\ntwo\nthree\nfour\nfive\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn config_round_trips_through_toml() {
+        let config = Config {
+            table: vec![TableConfig {
+                label: "a.txt".into(),
+                algorithm: "md5".into(),
+                index: PathBuf::from("idx/a.txt.idx"),
+                dictionary: PathBuf::from("folder/a.txt"),
+            }],
+        };
+        let rendered = toml::to_string_pretty(&config).expect("serialize");
+        let parsed: Config = toml::from_str(&rendered).expect("deserialize");
+
+        assert_eq!(parsed.table.len(), 1);
+        assert_eq!(parsed.table[0].label, "a.txt");
+        assert_eq!(parsed.table[0].algorithm, "md5");
+        assert_eq!(parsed.table[0].index, PathBuf::from("idx/a.txt.idx"));
+        assert_eq!(parsed.table[0].dictionary, PathBuf::from("folder/a.txt"));
+    }
 }
