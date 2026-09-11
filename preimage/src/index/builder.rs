@@ -69,42 +69,63 @@ impl IndexBuilder {
             pb.set_length(file_len);
         }
 
+        // Hashing is the expensive, embarrassingly parallel part; reading the file is
+        // inherently sequential. So this thread parses a batch of lines into
+        // (position, word) pairs, worker threads hash the batch across all cores, and
+        // the surviving entries are written back in wordlist order. The reader makes a
+        // single forward pass and the output is byte-identical to a serial build.
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
         let mut entries_written: u64 = 0;
         let mut position: u64 = 0;
+
+        // Reused across batches so the per-batch work does not reallocate.
         let mut line_buf = Vec::new();
+        let mut batch = Batch::default();
+        let mut entries: Vec<IndexEntry> = Vec::new();
 
         loop {
-            line_buf.clear();
-            let bytes_read = reader.read_until(b'\n', &mut line_buf)?;
-            if bytes_read == 0 {
+            batch.clear();
+
+            // Parse one batch of trimmed words, remembering each word's line position.
+            // `position` advances by the untrimmed line length for every line, so words
+            // the algorithm later rejects still move it -- exactly as the serial path did.
+            while batch.words.len() < BATCH_MAX_WORDS && batch.bytes.len() < BATCH_MAX_BYTES {
+                line_buf.clear();
+                let bytes_read = reader.read_until(b'\n', &mut line_buf)?;
+                if bytes_read == 0 {
+                    break;
+                }
+
+                // Both ends, matching PHP's trim($word, "\n\r") -- see the helper.
+                let word = super::trim_record_separators(&line_buf);
+                let start = batch.bytes.len();
+                batch.bytes.extend_from_slice(word);
+                batch.words.push(Word {
+                    position,
+                    start,
+                    len: word.len(),
+                });
+                position += bytes_read as u64;
+            }
+
+            if batch.words.is_empty() {
                 break;
             }
 
-            // Both ends, matching PHP's trim($word, "\n\r") -- see the helper.
-            let word = super::trim_record_separators(&line_buf);
+            // Hash the batch in parallel; `prefixes[i]` is `None` for a rejected word.
+            let prefixes = hash_batch(algorithm, &batch, threads);
 
-            let hash = match algorithm.hash(word) {
-                Some(h) => h,
-                None => {
-                    // Skip words that the algorithm rejects (e.g. NTLM on invalid UTF-8)
-                    position += bytes_read as u64;
-                    if let Some(pb) = progress {
-                        pb.set_position(position);
-                    }
-                    continue;
+            entries.clear();
+            for (word, prefix) in batch.words.iter().zip(&prefixes) {
+                if let Some(prefix) = prefix {
+                    entries.push(IndexEntry::new(*prefix, word.position));
                 }
-            };
-
-            // Take first 8 bytes, right-pad with zeros if shorter
-            let mut hash_prefix = [0u8; 8];
-            let copy_len = hash.len().min(8);
-            hash_prefix[..copy_len].copy_from_slice(&hash[..copy_len]);
-
-            let entry = IndexEntry::new(hash_prefix, position);
-            entry.write_to(&mut writer)?;
-
-            entries_written += 1;
-            position += bytes_read as u64;
+            }
+            IndexEntry::write_bulk(&mut writer, &entries, entries.len())?;
+            entries_written += entries.len() as u64;
 
             if let Some(pb) = progress {
                 pb.set_position(position);
@@ -117,6 +138,92 @@ impl IndexBuilder {
 
         Ok(entries_written)
     }
+}
+
+/// One trimmed word inside a [`Batch`]: its slice within the batch byte buffer and
+/// the wordlist position the entry must record.
+struct Word {
+    position: u64,
+    start: usize,
+    len: usize,
+}
+
+/// A batch of trimmed words handed to the workers: the concatenated word bytes and
+/// the per-word ranges into them. Reused across batches to avoid reallocating.
+#[derive(Default)]
+struct Batch {
+    bytes: Vec<u8>,
+    words: Vec<Word>,
+}
+
+impl Batch {
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.words.clear();
+    }
+}
+
+/// A batch ends at whichever cap is reached first: a word count, or a byte size so a
+/// run of very long words cannot make one batch consume unbounded memory.
+const BATCH_MAX_WORDS: usize = 1 << 16;
+const BATCH_MAX_BYTES: usize = 8 << 20;
+
+/// Hash every word in `batch` across up to `threads` workers, returning each word's
+/// stored 8-byte prefix (`None` where the algorithm rejected the word).
+///
+/// The output order matches `batch.words`, so the caller writes entries in wordlist
+/// order and the index is byte-identical to a serial build. `HashAlgorithm` is
+/// `Send + Sync`, so the one `&dyn` reference is shared across the workers as-is.
+fn hash_batch(
+    algorithm: &dyn HashAlgorithm,
+    batch: &Batch,
+    threads: usize,
+) -> Vec<Option<[u8; 8]>> {
+    let n = batch.words.len();
+    let mut prefixes: Vec<Option<[u8; 8]>> = vec![None; n];
+
+    let workers = threads.clamp(1, n.max(1));
+    if workers <= 1 {
+        for (word, slot) in batch.words.iter().zip(prefixes.iter_mut()) {
+            *slot = hash_prefix(algorithm, &batch.bytes[word.start..word.start + word.len]);
+        }
+        return prefixes;
+    }
+
+    // Hand each worker a disjoint, contiguous slice of the output and the matching
+    // range of words. `split_at_mut` keeps the borrows non-overlapping.
+    let chunk = n.div_ceil(workers);
+    std::thread::scope(|scope| {
+        let bytes = &batch.bytes;
+        let words = &batch.words;
+        let mut base = 0usize;
+        let mut rest = prefixes.as_mut_slice();
+        while !rest.is_empty() {
+            let take = chunk.min(rest.len());
+            let (head, tail) = rest.split_at_mut(take);
+            rest = tail;
+            let start_idx = base;
+            base += take;
+            scope.spawn(move || {
+                for (offset, slot) in head.iter_mut().enumerate() {
+                    let word = &words[start_idx + offset];
+                    *slot = hash_prefix(algorithm, &bytes[word.start..word.start + word.len]);
+                }
+            });
+        }
+    });
+
+    prefixes
+}
+
+/// The 8-byte prefix stored for a word: the first 8 bytes of the digest, right-padded
+/// with zeros for shorter digests. `None` if the algorithm rejects the word.
+fn hash_prefix(algorithm: &dyn HashAlgorithm, word: &[u8]) -> Option<[u8; 8]> {
+    let hash = algorithm.hash(word)?;
+    let mut prefix = [0u8; 8];
+    let copy_len = hash.len().min(8);
+    prefix[..copy_len].copy_from_slice(&hash[..copy_len]);
+    Some(prefix)
 }
 
 /// Fail if the builder read nothing from a wordlist that was not empty.
