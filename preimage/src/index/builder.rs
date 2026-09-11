@@ -1,8 +1,8 @@
-use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use anyhow::{bail, Result};
 use indicatif::ProgressBar;
+use memmap2::Mmap;
 
 use super::entry::IndexEntry;
 use crate::HashAlgorithm;
@@ -49,11 +49,10 @@ impl IndexBuilder {
     ) -> Result<u64> {
         let wordlist = std::fs::File::open(wordlist_path)?;
         let file_len = wordlist.metadata()?.len();
-        let mut reader = BufReader::new(wordlist);
 
-        // `File::create` truncates, and `BufReader::new` has not issued a single read yet,
-        // so if these two paths name the same file the wordlist is destroyed before it is
-        // read and the build then "succeeds" with zero entries. Refuse first.
+        // `File::create` truncates, so if these two paths name the same file the wordlist
+        // is destroyed before it is read and the build then "succeeds" with zero entries.
+        // Refuse before creating the output.
         if is_same_file(wordlist_path, output_path) {
             bail!(
                 "refusing to build: the output and the wordlist are the same file ({}). \
@@ -62,158 +61,144 @@ impl IndexBuilder {
             );
         }
 
-        let output = std::fs::File::create(output_path)?;
-        let mut writer = BufWriter::new(output);
+        let mut output = std::fs::File::create(output_path)?;
 
         if let Some(pb) = progress {
             pb.set_length(file_len);
         }
 
-        // Hashing is the expensive, embarrassingly parallel part; reading the file is
-        // inherently sequential. So this thread parses a batch of lines into
-        // (position, word) pairs, worker threads hash the batch across all cores, and
-        // the surviving entries are written back in wordlist order. The reader makes a
-        // single forward pass and the output is byte-identical to a serial build.
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-
-        let mut entries_written: u64 = 0;
-        let mut position: u64 = 0;
-
-        // Reused across batches so the per-batch work does not reallocate.
-        let mut line_buf = Vec::new();
-        let mut batch = Batch::default();
-        let mut entries: Vec<IndexEntry> = Vec::new();
-
-        loop {
-            batch.clear();
-
-            // Parse one batch of trimmed words, remembering each word's line position.
-            // `position` advances by the untrimmed line length for every line, so words
-            // the algorithm later rejects still move it -- exactly as the serial path did.
-            while batch.words.len() < BATCH_MAX_WORDS && batch.bytes.len() < BATCH_MAX_BYTES {
-                line_buf.clear();
-                let bytes_read = reader.read_until(b'\n', &mut line_buf)?;
-                if bytes_read == 0 {
-                    break;
-                }
-
-                // Both ends, matching PHP's trim($word, "\n\r") -- see the helper.
-                let word = super::trim_record_separators(&line_buf);
-                let start = batch.bytes.len();
-                batch.bytes.extend_from_slice(word);
-                batch.words.push(Word {
-                    position,
-                    start,
-                    len: word.len(),
-                });
-                position += bytes_read as u64;
-            }
-
-            if batch.words.is_empty() {
-                break;
-            }
-
-            // Hash the batch in parallel; `prefixes[i]` is `None` for a rejected word.
-            let prefixes = hash_batch(algorithm, &batch, threads);
-
-            entries.clear();
-            for (word, prefix) in batch.words.iter().zip(&prefixes) {
-                if let Some(prefix) = prefix {
-                    entries.push(IndexEntry::new(*prefix, word.position));
-                }
-            }
-            IndexEntry::write_bulk(&mut writer, &entries, entries.len())?;
-            entries_written += entries.len() as u64;
-
-            if let Some(pb) = progress {
-                pb.set_position(position);
-            }
+        // An empty wordlist has nothing to map or hash. `Mmap::map` also errors on a
+        // zero-length file on some platforms, so handle it before mapping.
+        if file_len == 0 {
+            return Ok(0);
         }
 
-        writer.flush()?;
+        // SAFETY: `Mmap::map` requires that the file not be modified while mapped, by
+        // anyone -- a concurrent truncation turns a read of the mapped pages into a
+        // SIGBUS that cannot be caught. This code cannot establish that property; what
+        // discharges it is the same deployment assumption the rest of the tool makes
+        // (see `LookupTable::open` and the README's "Trust" section): the wordlist is
+        // static data the operator owns and does not rewrite while a build runs.
+        let mmap = unsafe { Mmap::map(&wordlist)? };
+        let data: &[u8] = &mmap;
+        let n = data.len();
 
-        check_wordlist_was_fully_read(position, file_len, wordlist_path)?;
+        let threads = std::thread::available_parallelism()
+            .map(|t| t.get())
+            .unwrap_or(1);
+
+        // Both parsing and hashing run in parallel. The file is processed in line-aligned
+        // windows so the entries held in memory at once stay bounded; each window is split
+        // into line-aligned sub-ranges, one per worker. A word's stored position is its
+        // absolute byte offset, so the workers are independent and need no shared counter,
+        // and concatenating their output in range order reproduces wordlist order exactly
+        // -- the index is byte-identical to a serial build.
+        let mut entries_written: u64 = 0;
+        let mut wstart = 0usize;
+        while wstart < n {
+            let target = (wstart + WINDOW_BYTES).min(n);
+            let wend = line_aligned_end(data, target);
+            let ranges = split_into_line_aligned_ranges(data, wstart, wend, threads);
+
+            let written = std::thread::scope(|scope| -> Result<u64> {
+                let handles: Vec<_> = ranges
+                    .iter()
+                    .map(|&(start, end)| scope.spawn(move || process_range(algorithm, data, start, end)))
+                    .collect();
+
+                let mut count = 0u64;
+                for handle in handles {
+                    let entries = handle.join().expect("hash worker panicked");
+                    IndexEntry::write_bulk(&mut output, &entries, entries.len())?;
+                    count += entries.len() as u64;
+                }
+                Ok(count)
+            })?;
+
+            entries_written += written;
+            if let Some(pb) = progress {
+                pb.set_position(wend as u64);
+            }
+            wstart = wend;
+        }
+
+        check_wordlist_was_fully_read(n as u64, file_len, wordlist_path)?;
 
         Ok(entries_written)
     }
 }
 
-/// One trimmed word inside a [`Batch`]: its slice within the batch byte buffer and
-/// the wordlist position the entry must record.
-struct Word {
-    position: u64,
-    start: usize,
-    len: usize,
-}
+/// How much input one window covers. Larger windows mean fewer synchronization points
+/// between the parallel phase and the ordered write; smaller ones bound the entries
+/// held in memory at once. Windows are line-aligned, so a single line longer than this
+/// still ends up whole in one window.
+const WINDOW_BYTES: usize = 128 << 20;
 
-/// A batch of trimmed words handed to the workers: the concatenated word bytes and
-/// the per-word ranges into them. Reused across batches to avoid reallocating.
-#[derive(Default)]
-struct Batch {
-    bytes: Vec<u8>,
-    words: Vec<Word>,
-}
-
-impl Batch {
-    fn clear(&mut self) {
-        self.bytes.clear();
-        self.words.clear();
+/// The offset just past the first `\n` at or after `target`, or the end of `data` if
+/// there is none. Used to push a window or sub-range boundary onto a line boundary so
+/// no line is ever split across workers.
+fn line_aligned_end(data: &[u8], target: usize) -> usize {
+    if target >= data.len() {
+        return data.len();
+    }
+    match data[target..].iter().position(|&b| b == b'\n') {
+        Some(rel) => target + rel + 1,
+        None => data.len(),
     }
 }
 
-/// A batch ends at whichever cap is reached first: a word count, or a byte size so a
-/// run of very long words cannot make one batch consume unbounded memory.
-const BATCH_MAX_WORDS: usize = 1 << 16;
-const BATCH_MAX_BYTES: usize = 8 << 20;
+/// Split `[wstart, wend)` into `parts` contiguous ranges that each begin and end on a
+/// line boundary, so every worker sees whole lines. `wstart` is already a line start
+/// (the previous window ended after a `\n`, or it is 0). Ranges may be empty when there
+/// are fewer lines than workers; the boundaries are clamped to stay non-decreasing and
+/// within the window, so together they cover the window with no gaps or overlaps.
+fn split_into_line_aligned_ranges(
+    data: &[u8],
+    wstart: usize,
+    wend: usize,
+    parts: usize,
+) -> Vec<(usize, usize)> {
+    let parts = parts.max(1);
+    let span = wend - wstart;
 
-/// Hash every word in `batch` across up to `threads` workers, returning each word's
-/// stored 8-byte prefix (`None` where the algorithm rejected the word).
+    let mut bounds = Vec::with_capacity(parts + 1);
+    bounds.push(wstart);
+    for j in 1..parts {
+        let target = wstart + span * j / parts;
+        let prev = *bounds.last().expect("bounds is never empty");
+        let b = line_aligned_end(data, target).min(wend).max(prev);
+        bounds.push(b);
+    }
+    bounds.push(wend);
+
+    bounds.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+/// Parse and hash every whole line in `data[start..end)`, returning the surviving
+/// entries in order. `start` and `end` are line boundaries. A word's position is its
+/// absolute offset `pos`, matching the serial builder, and words the algorithm rejects
+/// simply produce no entry -- absolute positions make that need no bookkeeping.
 ///
-/// The output order matches `batch.words`, so the caller writes entries in wordlist
-/// order and the index is byte-identical to a serial build. `HashAlgorithm` is
-/// `Send + Sync`, so the one `&dyn` reference is shared across the workers as-is.
-fn hash_batch(
-    algorithm: &dyn HashAlgorithm,
-    batch: &Batch,
-    threads: usize,
-) -> Vec<Option<[u8; 8]>> {
-    let n = batch.words.len();
-    let mut prefixes: Vec<Option<[u8; 8]>> = vec![None; n];
+/// `HashAlgorithm` is `Send + Sync`, so the one `&dyn` reference is shared across
+/// workers as-is, reading straight from the memory-mapped wordlist with no copy.
+fn process_range(algorithm: &dyn HashAlgorithm, data: &[u8], start: usize, end: usize) -> Vec<IndexEntry> {
+    let mut entries = Vec::new();
+    let mut pos = start;
+    while pos < end {
+        let (line_end, next) = match data[pos..end].iter().position(|&b| b == b'\n') {
+            Some(rel) => (pos + rel, pos + rel + 1),
+            // No terminator: only possible on the file's final line when it lacks one.
+            None => (end, end),
+        };
 
-    let workers = threads.clamp(1, n.max(1));
-    if workers <= 1 {
-        for (word, slot) in batch.words.iter().zip(prefixes.iter_mut()) {
-            *slot = hash_prefix(algorithm, &batch.bytes[word.start..word.start + word.len]);
+        // Both ends, matching PHP's trim($word, "\n\r") -- see the helper.
+        let word = super::trim_record_separators(&data[pos..line_end]);
+        if let Some(prefix) = hash_prefix(algorithm, word) {
+            entries.push(IndexEntry::new(prefix, pos as u64));
         }
-        return prefixes;
+        pos = next;
     }
-
-    // Hand each worker a disjoint, contiguous slice of the output and the matching
-    // range of words. `split_at_mut` keeps the borrows non-overlapping.
-    let chunk = n.div_ceil(workers);
-    std::thread::scope(|scope| {
-        let bytes = &batch.bytes;
-        let words = &batch.words;
-        let mut base = 0usize;
-        let mut rest = prefixes.as_mut_slice();
-        while !rest.is_empty() {
-            let take = chunk.min(rest.len());
-            let (head, tail) = rest.split_at_mut(take);
-            rest = tail;
-            let start_idx = base;
-            base += take;
-            scope.spawn(move || {
-                for (offset, slot) in head.iter_mut().enumerate() {
-                    let word = &words[start_idx + offset];
-                    *slot = hash_prefix(algorithm, &bytes[word.start..word.start + word.len]);
-                }
-            });
-        }
-    });
-
-    prefixes
+    entries
 }
 
 /// The 8-byte prefix stored for a word: the first 8 bytes of the digest, right-padded
@@ -540,5 +525,96 @@ mod tests {
         let mut expected_prefix = [0u8; 8];
         expected_prefix.copy_from_slice(&expected_hash[..8]);
         assert_eq!(entry.hash_prefix, expected_prefix);
+    }
+
+    /// An independent, dead-simple serial reference: split on `\n`, trim `\n\r` from
+    /// both ends, hash, and record `(line-start offset, 8-byte prefix)` for each word
+    /// the algorithm accepts. Deliberately not the builder's own helpers, so it checks
+    /// the parallel path against something, not against itself.
+    fn serial_reference(data: &[u8], alg: &dyn crate::HashAlgorithm) -> Vec<(u64, [u8; 8])> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos < data.len() {
+            let (line_end, next) = match data[pos..].iter().position(|&b| b == b'\n') {
+                Some(rel) => (pos + rel, pos + rel + 1),
+                None => (data.len(), data.len()),
+            };
+            let mut word = &data[pos..line_end];
+            while matches!(word.last(), Some(b'\n' | b'\r')) {
+                word = &word[..word.len() - 1];
+            }
+            while matches!(word.first(), Some(b'\n' | b'\r')) {
+                word = &word[1..];
+            }
+            if let Some(hash) = alg.hash(word) {
+                let mut prefix = [0u8; 8];
+                let c = hash.len().min(8);
+                prefix[..c].copy_from_slice(&hash[..c]);
+                out.push((pos as u64, prefix));
+            }
+            pos = next;
+        }
+        out
+    }
+
+    fn read_index(path: &Path) -> Vec<(u64, [u8; 8])> {
+        let data = std::fs::read(path).expect("read index");
+        assert_eq!(data.len() % ENTRY_SIZE, 0);
+        data.chunks_exact(ENTRY_SIZE)
+            .map(|c| {
+                let e = IndexEntry::read_from(&mut &c[..]).expect("entry");
+                (e.position(), e.hash_prefix)
+            })
+            .collect()
+    }
+
+    /// The parallel, windowed, memory-mapped build must match the serial reference
+    /// exactly -- same entries, same order, same positions -- across many lines (so the
+    /// input is split among several workers) with a mix of plain words, CRLF endings,
+    /// leading/trailing spaces, empty lines, invalid UTF-8 (which NTLM rejects but MD5
+    /// keeps), and a final line with no terminator.
+    #[test]
+    fn test_parallel_build_matches_serial_reference() {
+        use std::io::Write;
+        let mut data = Vec::new();
+        for i in 0..60_000u32 {
+            match i % 7 {
+                0 => data.extend_from_slice(format!("word{i}\n").as_bytes()),
+                1 => data.extend_from_slice(format!("pass{i}\r\n").as_bytes()),
+                2 => data.push(b'\n'),
+                3 => {
+                    data.extend_from_slice(&[0xff, 0xfe]);
+                    data.push(b'\n');
+                }
+                4 => data.extend_from_slice(format!("  spaced{i}  \n").as_bytes()),
+                5 => data.extend_from_slice(format!("{i}\n").as_bytes()),
+                _ => data.extend_from_slice(format!("user{i}@example.com\n").as_bytes()),
+            }
+        }
+        data.extend_from_slice(b"tail-with-no-newline");
+
+        let mut wordlist = NamedTempFile::new().expect("temp file");
+        wordlist.write_all(&data).expect("write");
+        wordlist.flush().expect("flush");
+
+        for alg in [&Md5 as &dyn crate::HashAlgorithm, &Ntlm as &dyn crate::HashAlgorithm] {
+            let output = NamedTempFile::new().expect("temp file");
+            let count = IndexBuilder::build(alg, wordlist.path(), output.path(), None)
+                .expect("build failed");
+
+            let expected = serial_reference(&data, alg);
+            assert_eq!(
+                count as usize,
+                expected.len(),
+                "{}: entry count must match the serial reference",
+                alg.name()
+            );
+            assert_eq!(
+                read_index(output.path()),
+                expected,
+                "{}: parallel build must match the serial reference byte-for-byte",
+                alg.name()
+            );
+        }
     }
 }
