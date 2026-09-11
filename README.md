@@ -28,26 +28,31 @@ The figures below are from release builds of upstream commit `066dce2` and this
 fork's performance code at `0df4d21`, run on the same Intel Core i5-14600T system
 (20 logical CPUs, 32 GiB RAM, NVMe storage).
 
-The corpus is FrequencyWords' English OpenSubtitles-derived `en_full.txt`:
-1,656,996 lines / 19,977,552 bytes, SHA-256
-`7fea67ab954e2c01df6c608c9826e594cf36f8823b3243554f88245fb75dc506`.
-It is available from
-https://github.com/hermitdave/FrequencyWords/blob/master/content/2018/en/en_full.txt.
-The resulting index is about 23 MiB.
+The larger benchmark corpus is 13 FrequencyWords 2018 language files concatenated
+in a fixed order (`en,de,fr,es,it,pt,nl,pl,sv,no,da,cs,fi`): 15,386,951 lines /
+206,759,414 bytes (about 197 MiB), SHA-256
+`bc217863338a6f4bd033292a286a4eddf2e54378923c446d4b16334982947038`.
+The resulting index is 215,417,314 bytes (about 205 MiB).
 
 | workload | upstream | this fork | result |
 | --- | ---: | ---: | ---: |
-| `create` MD5 | 290.3 ms | **34.0 ms** | **8.53× faster** |
-| `create` NTLM | 263.1 ms | **36.8 ms** | **7.14× faster** |
-| sort, 2 GiB budget | 95.6 ms | 88.1 ms | effectively unchanged |
-| sort, 4 MiB budget | 13.088 s | **0.189 s** | **69.2× faster** |
-| sort, 1 MiB budget | 21.461 s | **0.291 s** | **73.7× faster** |
-| 4-hash lookup batch | **3.627 ms** | 3.715 ms | effectively unchanged |
+| `create` MD5 | 2.663 s | **0.598 s** | **4.46× faster** |
+| `create` NTLM | 2.522 s | **0.492 s** | **5.13× faster** |
+| sort, 2 GiB budget | 1.202 s | 1.240 s | effectively unchanged |
+| sort, 128 MiB budget | 66.212 s | **2.074 s** | **31.9× faster** |
+| sort, 64 MiB budget | 83.599 s | **1.808 s** | **46.2× faster** |
+| 4-hash lookup batch | 3.459 ms | 3.499 ms | effectively unchanged |
 
-`create` results are medians of 10 alternating runs per algorithm. The 2 GiB sort
-result is the median of 20 alternating runs; the 4 MiB and 1 MiB results are medians
-of three runs each. Lookup is the median of 40 alternating runs using three known
-hits (from the beginning, middle, and end of the corpus) plus one guaranteed miss.
+`create` results are medians of five alternating runs per algorithm. The 2 GiB sort
+result is the median of five alternating runs; the 128 MiB result is the median of
+two alternating runs; the 64 MiB result is the median of three runs. Lookup is the
+median of 20 alternating runs using three known hits (from the beginning, middle,
+and end of the corpus) plus one guaranteed miss.
+
+A separate real-world run on an approximately 15 GB dictionary was observed to drop
+from about 3 hours with upstream to about 6 minutes with this fork (roughly 30×).
+That field result is included as a scale datapoint, not as part of the controlled
+benchmark above.
 
 The sort numbers need context: when the whole index fits the configured memory
 budget, both versions sort in memory and performance is essentially the same. The
