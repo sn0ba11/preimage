@@ -14,8 +14,10 @@ impl super::IndexFile {
     ///
     /// Files that fit in the budget are sorted in one in-memory pass. Larger
     /// files are sorted with an external merge sort: sorted runs the size of the
-    /// budget are written back in place, then merged. **Do not interrupt** — the
-    /// file will be corrupted if sorting is interrupted.
+    /// budget are written back in place, then merged into a scratch file beside
+    /// the index (needing free space about the size of the index) which is
+    /// renamed over it. **Do not interrupt** — run generation rewrites the file
+    /// in place, so an interrupted or failed sort can leave it partially sorted.
     pub fn sort(&self, memory_bytes: usize, progress: Option<&ProgressBar>) -> Result<()> {
         let mut sorter = IndexSorter::new(memory_bytes);
         sorter.sort_file(&self.path, progress)
