@@ -16,6 +16,40 @@ It is a Rust port of [crackstation-hashdb](https://github.com/defuse/crackstatio
 the PHP/C code behind [crackstation.net](https://crackstation.net/), and it reads and
 writes the same on-disk index format.
 
+## This fork
+
+Same tool, same on-disk format, same lookups — building and sorting are just a lot
+faster, and `create` can ingest a whole folder. Every new output is byte-identical to
+the original's, so indexes and lookups are unaffected. Figures below are on a real
+57.4M-word dictionary, 8 cores.
+
+- **Parallel indexing.** `create` memory-maps the wordlist and parses *and* hashes
+  across every core instead of one at a time:
+
+  | `create` | original | this fork |
+  | --- | --- | --- |
+  | NTLM | 16.0s | **2.4s (6.6×)** |
+  | md5  | ~14s  | **~1.9s (7.5×)** |
+
+- **External-merge sort.** The out-of-core sort used to do a disk seek per entry; it
+  now generates sorted runs and k-way merges them with sequential I/O. A 2M-entry index
+  at a 1 MiB budget goes **151.5s → 0.34s (446×)**, and the gap only widens with size —
+  the 57M index above sorts in **7.0s** here. (An index that exceeds the memory budget
+  is merged through a scratch file about its own size, then renamed over it; one that
+  fits the budget is still sorted in place with no scratch.)
+
+- **Folder ingest.** `create --dir <folder>` indexes a whole folder in one command,
+  with `--mode combined` (concatenate into one index) or `--mode separate` (one index
+  per file plus a generated `tables.toml` for `lookup --config`).
+
+- **Lookup is unchanged** — no lookup code was touched, and it measures flat.
+
+Install this fork's CLI with:
+
+```bash
+cargo install --git https://github.com/briangillan/preimage preimage
+```
+
 ## How it works
 
 A wordlist is arbitrary bytes separated by `\n`. For each word, `preimage` records a
