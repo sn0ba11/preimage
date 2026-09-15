@@ -238,6 +238,31 @@ preimage cloudap build \
 `--threads 0` (the default) uses every available logical CPU. `--fresh` discards
 both an existing completed cache and any resumable partial build.
 
+If `nvcc` is in `PATH` when Preimage is compiled, the build automatically includes
+the CUDA PBKDF2 kernel. `--backend auto` (the default) then uses an available NVIDIA
+GPU and falls back to the parallel CPU implementation when CUDA is not compiled in
+or no device is present. Use `--backend cpu` for a reproducible CPU-only run, or
+`--backend cuda` to require a GPU and fail instead of falling back:
+
+```bash
+cargo build --release
+preimage cloudap build \
+  --backend cuda \
+  --wordlist words.txt \
+  --output words.cloudap33700.pim
+```
+
+The CPU and CUDA builders write the same version-1 cache records. CUDA accelerates
+the 10,000-round PBKDF2 build; it does not materially help the later cache scan,
+which streams already-derived keys and is normally limited by memory/storage I/O.
+
+On an RTX 3070, a sustained 262,144-candidate CUDA validation batch measured
+133.5 k candidates/s. Hashcat 7.1.2 mode 33700 measured 134.5 kH/s on the same host
+(`Accel:2 Loops:500 Thr:512 Vec:1`). The GPU-produced cache was byte-identical to
+the CPU-produced cache, including Unicode and long-password test cases. At that
+rate, the 15.4-million-line benchmark corpus described above spends roughly two
+minutes in the KDF; actual ingest also includes dictionary hashing and cache I/O.
+
 ### Build a folder incrementally
 
 For the work-server layout used by this fork:

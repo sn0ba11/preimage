@@ -10,9 +10,11 @@
 //! precomputed keys and performs only the cheap target-specific AES marker
 //! check.
 
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
 use aes::Aes256;
@@ -34,6 +36,50 @@ const MAX_DICTIONARY_OFFSET: u64 = 1u64 << 48;
 
 /// Current Windows CloudAP mode-33700 iteration count.
 pub const DEFAULT_CLOUDAP_ITERATIONS: u32 = 10_000;
+
+/// KDF implementation used while building a CloudAP cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudapBuildBackend {
+    /// Use CUDA when this binary was built with nvcc and a device is available.
+    Auto,
+    /// Use the portable, parallel CPU implementation.
+    Cpu,
+    /// Require CUDA; return an error instead of silently falling back.
+    Cuda,
+}
+
+impl fmt::Display for CloudapBuildBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+        })
+    }
+}
+
+impl FromStr for CloudapBuildBackend {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "cpu" => Ok(Self::Cpu),
+            "cuda" => Ok(Self::Cuda),
+            _ => bail!("unknown CloudAP build backend {value:?}; use auto, cpu, or cuda"),
+        }
+    }
+}
+
+/// Whether this binary contains the optional nvcc-built CUDA kernel.
+pub const fn cloudap_cuda_compiled() -> bool {
+    cfg!(preimage_cuda)
+}
+
+/// Return the number of usable CUDA devices, or zero when CUDA was not compiled in.
+pub fn cloudap_cuda_device_count() -> Result<usize> {
+    cuda_device_count()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudapTarget {
@@ -89,6 +135,7 @@ pub struct CloudapMatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudapBuildStats {
+    pub backend: CloudapBuildBackend,
     pub records: u64,
     pub invalid_utf8_lines: u64,
     pub resumed_records: u64,
@@ -161,9 +208,32 @@ impl CloudapCache {
         fresh: bool,
         progress: Option<&ProgressBar>,
     ) -> Result<CloudapBuildStats> {
+        Self::build_with_backend(
+            dictionary_path,
+            output_path,
+            iterations,
+            threads,
+            fresh,
+            CloudapBuildBackend::Cpu,
+            progress,
+        )
+    }
+
+    /// Build with an explicitly selected CPU/CUDA policy. `Auto` selects CUDA
+    /// only when the binary contains the kernel and a device is available.
+    pub fn build_with_backend(
+        dictionary_path: &Path,
+        output_path: &Path,
+        iterations: u32,
+        threads: usize,
+        fresh: bool,
+        backend: CloudapBuildBackend,
+        progress: Option<&ProgressBar>,
+    ) -> Result<CloudapBuildStats> {
         if iterations == 0 {
             bail!("CloudAP iteration count must be non-zero");
         }
+        let backend = resolve_backend(backend)?;
         let dictionary_file = File::open(dictionary_path)
             .with_context(|| format!("open dictionary {}", dictionary_path.display()))?;
         let dictionary_len = dictionary_file.metadata()?.len();
@@ -182,7 +252,7 @@ impl CloudapCache {
 
         if dictionary_len == 0 {
             // Mapping an empty file is platform-dependent. Its SHA-256 is stable.
-            return build_empty_cache(dictionary_path, output_path, iterations, fresh);
+            return build_empty_cache(dictionary_path, output_path, iterations, backend, fresh);
         }
 
         // SAFETY: same static-input assumption as the regular Preimage builder.
@@ -244,18 +314,24 @@ impl CloudapCache {
             let target = (wstart + DEFAULT_WINDOW_BYTES).min(data.len());
             let wend = line_aligned_end(data, target);
             let ranges = split_line_ranges(data, wstart, wend, worker_count);
-            let chunks = std::thread::scope(|scope| {
-                let handles: Vec<_> = ranges
-                    .iter()
-                    .map(|&(start, end)| {
-                        scope.spawn(move || process_range(data, start, end, iterations))
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|handle| handle.join().expect("CloudAP KDF worker panicked"))
-                    .collect::<Vec<_>>()
-            });
+            let chunks = match backend {
+                CloudapBuildBackend::Cpu => std::thread::scope(|scope| {
+                    let handles: Vec<_> = ranges
+                        .iter()
+                        .map(|&(start, end)| {
+                            scope.spawn(move || process_range(data, start, end, iterations))
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|handle| handle.join().expect("CloudAP KDF worker panicked"))
+                        .collect::<Vec<_>>()
+                }),
+                CloudapBuildBackend::Cuda => {
+                    vec![process_cuda_ranges(data, &ranges, iterations)?]
+                }
+                CloudapBuildBackend::Auto => unreachable!("backend is resolved before building"),
+            };
 
             for chunk in chunks {
                 output.write_all(&chunk.bytes)?;
@@ -289,6 +365,7 @@ impl CloudapCache {
         })?;
 
         Ok(CloudapBuildStats {
+            backend,
             records,
             invalid_utf8_lines,
             resumed_records,
@@ -475,6 +552,190 @@ fn process_range(data: &[u8], start: usize, end: usize, iterations: u32) -> Proc
     result
 }
 
+fn resolve_backend(requested: CloudapBuildBackend) -> Result<CloudapBuildBackend> {
+    match requested {
+        CloudapBuildBackend::Cpu => Ok(CloudapBuildBackend::Cpu),
+        CloudapBuildBackend::Auto => Ok(if cuda_device_count().unwrap_or(0) > 0 {
+            CloudapBuildBackend::Cuda
+        } else {
+            CloudapBuildBackend::Cpu
+        }),
+        CloudapBuildBackend::Cuda => {
+            if !cloudap_cuda_compiled() {
+                bail!(
+                    "CUDA support is not present in this binary; rebuild Preimage on a host with nvcc in PATH"
+                );
+            }
+            if cuda_device_count()? == 0 {
+                bail!("CUDA was requested but no CUDA device is available");
+            }
+            Ok(CloudapBuildBackend::Cuda)
+        }
+    }
+}
+
+#[derive(Default)]
+struct PreparedCudaChunk {
+    key_blocks: Vec<u8>,
+    offsets: Vec<u64>,
+    invalid_utf8_lines: u64,
+}
+
+fn process_cuda_ranges(
+    data: &[u8],
+    ranges: &[(usize, usize)],
+    iterations: u32,
+) -> Result<ProcessedChunk> {
+    let prepared = std::thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|&(start, end)| scope.spawn(move || prepare_cuda_range(data, start, end)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .expect("CloudAP CUDA preparation worker panicked")
+            })
+            .collect::<Vec<_>>()
+    });
+    let record_count: usize = prepared.iter().map(|chunk| chunk.offsets.len()).sum();
+    let mut key_blocks = Vec::with_capacity(record_count * 64);
+    let mut offsets = Vec::with_capacity(record_count);
+    let mut invalid_utf8_lines = 0;
+    for chunk in prepared {
+        key_blocks.extend_from_slice(&chunk.key_blocks);
+        offsets.extend_from_slice(&chunk.offsets);
+        invalid_utf8_lines += chunk.invalid_utf8_lines;
+    }
+    if offsets.is_empty() {
+        return Ok(ProcessedChunk {
+            invalid_utf8_lines,
+            ..ProcessedChunk::default()
+        });
+    }
+    let derived = cuda_pbkdf2(&key_blocks, offsets.len(), iterations)?;
+    let mut bytes = Vec::with_capacity(offsets.len() * RECORD_SIZE);
+    for (index, offset) in offsets.into_iter().enumerate() {
+        bytes.extend_from_slice(&derived[index * KEY_SIZE..(index + 1) * KEY_SIZE]);
+        encode_offset(offset, &mut bytes);
+    }
+    Ok(ProcessedChunk {
+        bytes,
+        records: record_count as u64,
+        invalid_utf8_lines,
+    })
+}
+
+fn prepare_cuda_range(data: &[u8], start: usize, end: usize) -> PreparedCudaChunk {
+    let mut result = PreparedCudaChunk::default();
+    let mut pos = start;
+    let mut utf16 = Vec::with_capacity(128);
+    while pos < end {
+        let (line_end, next) = match data[pos..end].iter().position(|&byte| byte == b'\n') {
+            Some(relative) => (pos + relative, pos + relative + 1),
+            None => (end, end),
+        };
+        let mut word = &data[pos..line_end];
+        while matches!(word.first(), Some(b'\r' | b'\n')) {
+            word = &word[1..];
+        }
+        while matches!(word.last(), Some(b'\r' | b'\n')) {
+            word = &word[..word.len() - 1];
+        }
+        match std::str::from_utf8(word) {
+            Ok(password) => {
+                utf16.clear();
+                utf16.reserve(password.len() * 2);
+                for unit in password.encode_utf16() {
+                    utf16.extend_from_slice(&unit.to_le_bytes());
+                }
+                let mut key_block = [0u8; 64];
+                if utf16.len() <= key_block.len() {
+                    key_block[..utf16.len()].copy_from_slice(&utf16);
+                } else {
+                    key_block[..32].copy_from_slice(&Sha256::digest(&utf16));
+                }
+                result.key_blocks.extend_from_slice(&key_block);
+                result.offsets.push(pos as u64);
+            }
+            Err(_) => result.invalid_utf8_lines += 1,
+        }
+        pos = next;
+    }
+    result
+}
+
+#[cfg(preimage_cuda)]
+fn cuda_device_count() -> Result<usize> {
+    use std::ffi::CStr;
+    use std::os::raw::{c_char, c_int};
+
+    unsafe extern "C" {
+        fn preimage_cuda_device_count(
+            count: *mut c_int,
+            error: *mut c_char,
+            error_len: usize,
+        ) -> c_int;
+    }
+    let mut count = 0;
+    let mut error = [0i8; 512];
+    let status = unsafe { preimage_cuda_device_count(&mut count, error.as_mut_ptr(), error.len()) };
+    if status != 0 {
+        let message = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
+        bail!("CUDA device query failed: {message}");
+    }
+    Ok(count.max(0) as usize)
+}
+
+#[cfg(not(preimage_cuda))]
+fn cuda_device_count() -> Result<usize> {
+    Ok(0)
+}
+
+#[cfg(preimage_cuda)]
+fn cuda_pbkdf2(key_blocks: &[u8], count: usize, iterations: u32) -> Result<Vec<u8>> {
+    use std::ffi::CStr;
+    use std::os::raw::{c_char, c_int};
+
+    unsafe extern "C" {
+        fn preimage_cloudap_pbkdf2(
+            keys: *const u8,
+            count: u64,
+            iterations: u32,
+            outputs: *mut u8,
+            error: *mut c_char,
+            error_len: usize,
+        ) -> c_int;
+    }
+    if key_blocks.len() != count * 64 {
+        bail!("internal CUDA key-block length mismatch");
+    }
+    let mut output = vec![0u8; count * KEY_SIZE];
+    let mut error = [0i8; 512];
+    let status = unsafe {
+        preimage_cloudap_pbkdf2(
+            key_blocks.as_ptr(),
+            count as u64,
+            iterations,
+            output.as_mut_ptr(),
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    if status != 0 {
+        let message = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
+        bail!("CUDA PBKDF2 failed: {message}");
+    }
+    Ok(output)
+}
+
+#[cfg(not(preimage_cuda))]
+fn cuda_pbkdf2(_key_blocks: &[u8], _count: usize, _iterations: u32) -> Result<Vec<u8>> {
+    bail!("CUDA support is not present in this binary")
+}
+
 fn prepare_partial(
     partial: &mut File,
     expected_header: &Header,
@@ -529,6 +790,7 @@ fn build_empty_cache(
     dictionary_path: &Path,
     output_path: &Path,
     iterations: u32,
+    backend: CloudapBuildBackend,
     fresh: bool,
 ) -> Result<CloudapBuildStats> {
     if output_path.exists() && !fresh {
@@ -551,6 +813,7 @@ fn build_empty_cache(
     }
     std::fs::write(output_path, header.encode())?;
     Ok(CloudapBuildStats {
+        backend,
         records: 0,
         invalid_utf8_lines: 0,
         resumed_records: 0,
@@ -804,5 +1067,80 @@ mod tests {
             "$MSONLINEACCOUNT$0$10000$00112233445566778899aabbccddeeff"
         )
         .is_err());
+    }
+
+    #[test]
+    fn backend_names_parse_and_display() {
+        for (name, backend) in [
+            ("auto", CloudapBuildBackend::Auto),
+            ("cpu", CloudapBuildBackend::Cpu),
+            ("cuda", CloudapBuildBackend::Cuda),
+        ] {
+            assert_eq!(name.parse::<CloudapBuildBackend>().unwrap(), backend);
+            assert_eq!(backend.to_string(), name);
+        }
+        assert!("gpu".parse::<CloudapBuildBackend>().is_err());
+    }
+
+    #[test]
+    #[cfg(not(preimage_cuda))]
+    fn explicit_cuda_fails_closed_when_kernel_is_not_compiled() {
+        let dir = tempdir().unwrap();
+        let words = dir.path().join("words.txt");
+        let cache = dir.path().join("cloudap33700.pim");
+        std::fs::write(&words, b"password\n").unwrap();
+        let error = CloudapCache::build_with_backend(
+            &words,
+            &cache,
+            4,
+            1,
+            false,
+            CloudapBuildBackend::Cuda,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("CUDA support is not present"));
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    #[cfg(preimage_cuda)]
+    fn cuda_backend_is_byte_identical_to_cpu_when_a_device_is_available() {
+        if cloudap_cuda_device_count().unwrap_or(0) == 0 {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let words = dir.path().join("words.txt");
+        let cpu_cache = dir.path().join("cpu.pim");
+        let cuda_cache = dir.path().join("cuda.pim");
+        std::fs::write(
+            &words,
+            "password\nCorrectHorse\nemoji-🔐\nthis password deliberately exceeds thirty-two UTF-16 code units\n",
+        )
+        .unwrap();
+        CloudapCache::build_with_backend(
+            &words,
+            &cpu_cache,
+            8,
+            2,
+            false,
+            CloudapBuildBackend::Cpu,
+            None,
+        )
+        .unwrap();
+        CloudapCache::build_with_backend(
+            &words,
+            &cuda_cache,
+            8,
+            2,
+            false,
+            CloudapBuildBackend::Cuda,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(cpu_cache).unwrap(),
+            std::fs::read(cuda_cache).unwrap()
+        );
     }
 }

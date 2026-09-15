@@ -8,8 +8,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use preimage::{
-    get_algorithm, CloudapCache, CloudapTarget, HashAlgorithm, HashResult, IndexFile,
-    PreimageOracle, ALGORITHM_NAMES, DEFAULT_CLOUDAP_ITERATIONS,
+    get_algorithm, CloudapBuildBackend, CloudapCache, CloudapTarget, HashAlgorithm, HashResult,
+    IndexFile, PreimageOracle, ALGORITHM_NAMES, DEFAULT_CLOUDAP_ITERATIONS,
 };
 
 #[path = "shared/memory_size.rs"]
@@ -154,6 +154,9 @@ struct CloudapBuildArgs {
     /// Worker threads; 0 uses all available logical CPUs
     #[arg(long, default_value_t = 0)]
     threads: usize,
+    /// KDF backend: auto uses CUDA when this binary and host support it
+    #[arg(long, default_value_t = CloudapBuildBackend::Auto)]
+    backend: CloudapBuildBackend,
     /// Discard completed/partial output and rebuild from the beginning
     #[arg(long)]
     fresh: bool,
@@ -690,7 +693,14 @@ fn cmd_cloudap_build(args: CloudapBuildArgs) -> Result<()> {
             if args.out_dir.is_some() || args.config.is_some() {
                 bail!("--out-dir/--config are only valid with --dir");
             }
-            build_one_cloudap_cache(wordlist, output, args.iterations, args.threads, args.fresh)
+            build_one_cloudap_cache(
+                wordlist,
+                output,
+                args.iterations,
+                args.threads,
+                args.backend,
+                args.fresh,
+            )
         }
         (None, Some(dir)) => {
             if args.output.is_some() {
@@ -752,6 +762,7 @@ fn cmd_cloudap_build(args: CloudapBuildArgs) -> Result<()> {
                         &cache,
                         args.iterations,
                         args.threads,
+                        args.backend,
                         args.fresh,
                     )?;
                 }
@@ -787,13 +798,23 @@ fn build_one_cloudap_cache(
     cache: &Path,
     iterations: u32,
     threads: usize,
+    backend: CloudapBuildBackend,
     fresh: bool,
 ) -> Result<()> {
     let pb = cloudap_build_progress_bar();
-    let stats = CloudapCache::build(dictionary, cache, iterations, threads, fresh, Some(&pb))?;
+    let stats = CloudapCache::build_with_backend(
+        dictionary,
+        cache,
+        iterations,
+        threads,
+        fresh,
+        backend,
+        Some(&pb),
+    )?;
     pb.finish_and_clear();
     println!(
-        "CloudAP cache complete: {} candidates ({} invalid UTF-8 line(s) skipped, {} resumed) -> {}",
+        "CloudAP cache complete [{}]: {} candidates ({} invalid UTF-8 line(s) skipped, {} resumed) -> {}",
+        stats.backend,
         stats.records,
         stats.invalid_utf8_lines,
         stats.resumed_records,

@@ -21,7 +21,8 @@ pub use allthehashes::*;
 pub use indicatif;
 
 pub use cloudap::{
-    CloudapBuildStats, CloudapCache, CloudapMatch, CloudapTarget, DEFAULT_CLOUDAP_ITERATIONS,
+    cloudap_cuda_compiled, cloudap_cuda_device_count, CloudapBuildBackend, CloudapBuildStats,
+    CloudapCache, CloudapMatch, CloudapTarget, DEFAULT_CLOUDAP_ITERATIONS,
 };
 pub use index::entry;
 pub use index::lookup::{LookupMatch, LookupOutcome, LookupTable};
