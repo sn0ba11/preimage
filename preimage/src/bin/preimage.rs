@@ -3,12 +3,13 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use preimage::{
-    get_algorithm, HashAlgorithm, HashResult, IndexFile, PreimageOracle, ALGORITHM_NAMES,
+    get_algorithm, CloudapCache, CloudapTarget, HashAlgorithm, HashResult, IndexFile,
+    PreimageOracle, ALGORITHM_NAMES, DEFAULT_CLOUDAP_ITERATIONS,
 };
 
 #[path = "shared/memory_size.rs"]
@@ -111,8 +112,82 @@ EXAMPLE:
     },
     /// Look up hashes against index(es)
     Lookup(LookupArgs),
+    /// Build or query reusable CloudAP / Hashcat mode 33700 KDF caches
+    Cloudap {
+        #[command(subcommand)]
+        command: CloudapCommands,
+    },
     /// List supported hash algorithms
     List,
+}
+
+#[derive(Subcommand)]
+enum CloudapCommands {
+    /// Precompute unsalted CloudAP PBKDF2 keys for one wordlist or a folder
+    Build(CloudapBuildArgs),
+    /// Scan one cache, or a generated cache config, against a 33700 target
+    Scan(CloudapScanArgs),
+    /// Verify a completed cache and its dictionary binding
+    Check(CloudapCheckArgs),
+}
+
+#[derive(clap::Args)]
+struct CloudapBuildArgs {
+    /// One dictionary/wordlist to precompute
+    #[arg(short, long)]
+    wordlist: Option<PathBuf>,
+    /// Folder of wordlists; each regular file gets its own resumable cache
+    #[arg(long)]
+    dir: Option<PathBuf>,
+    /// Output cache for --wordlist
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Output directory for --dir caches
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
+    /// TOML config written for --dir and accepted by `cloudap scan --config`
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// PBKDF2 iteration count; current CloudAP/33700 uses 10000
+    #[arg(long, default_value_t = DEFAULT_CLOUDAP_ITERATIONS)]
+    iterations: u32,
+    /// Worker threads; 0 uses all available logical CPUs
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+    /// Discard completed/partial output and rebuild from the beginning
+    #[arg(long)]
+    fresh: bool,
+}
+
+#[derive(clap::Args)]
+struct CloudapScanArgs {
+    /// One completed CloudAP cache
+    #[arg(short = 'i', long)]
+    cache: Option<PathBuf>,
+    /// Dictionary paired with --cache
+    #[arg(short, long)]
+    dictionary: Option<PathBuf>,
+    /// Config produced by `cloudap build --dir`
+    #[arg(short = 'c', long)]
+    config: Option<PathBuf>,
+    /// Read one `$MSONLINEACCOUNT$0$...` target from a Spectre/Hashcat .hash file
+    #[arg(long)]
+    target_file: Option<PathBuf>,
+    /// Return every matching duplicate instead of stopping at the first hit
+    #[arg(long)]
+    all: bool,
+    /// `$MSONLINEACCOUNT$0$...` mode-33700 target (omit when using --target-file)
+    target: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct CloudapCheckArgs {
+    /// Completed CloudAP cache
+    #[arg(short = 'i', long)]
+    cache: PathBuf,
+    /// Dictionary paired with the cache
+    #[arg(short, long)]
+    dictionary: PathBuf,
 }
 
 /// How to ingest a `--dir` of wordlists.
@@ -200,6 +275,7 @@ fn main() -> Result<()> {
         Commands::Sort { memory, ram, index } => cmd_sort(memory, ram, &index),
         Commands::Check { index } => cmd_check(&index),
         Commands::Lookup(args) => cmd_lookup(args),
+        Commands::Cloudap { command } => cmd_cloudap(command),
         Commands::List => cmd_algorithms(),
     }
 }
@@ -568,6 +644,241 @@ fn cmd_check(index_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn cmd_cloudap(command: CloudapCommands) -> Result<()> {
+    match command {
+        CloudapCommands::Build(args) => cmd_cloudap_build(args),
+        CloudapCommands::Scan(args) => cmd_cloudap_scan(args),
+        CloudapCommands::Check(args) => cmd_cloudap_check(args),
+    }
+}
+
+fn cloudap_build_progress_bar() -> ProgressBar {
+    let pb = ProgressBar::new(0);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+            )
+            .expect("valid template")
+            .progress_chars("#>-"),
+    );
+    pb
+}
+
+fn cloudap_scan_progress_bar() -> ProgressBar {
+    let pb = ProgressBar::new(0);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} candidates ({eta})",
+            )
+            .expect("valid template")
+            .progress_chars("#>-"),
+    );
+    pb
+}
+
+fn cmd_cloudap_build(args: CloudapBuildArgs) -> Result<()> {
+    match (args.wordlist.as_ref(), args.dir.as_ref()) {
+        (Some(_), Some(_)) => bail!("pass either --wordlist or --dir, not both"),
+        (None, None) => bail!("pass --wordlist <file> or --dir <folder>"),
+        (Some(wordlist), None) => {
+            let output = args
+                .output
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--output <cache> is required with --wordlist"))?;
+            if args.out_dir.is_some() || args.config.is_some() {
+                bail!("--out-dir/--config are only valid with --dir");
+            }
+            build_one_cloudap_cache(wordlist, output, args.iterations, args.threads, args.fresh)
+        }
+        (None, Some(dir)) => {
+            if args.output.is_some() {
+                bail!("--output is only valid with --wordlist");
+            }
+            let out_dir = args
+                .out_dir
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--out-dir <folder> is required with --dir"))?;
+            let config_path = args
+                .config
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--config <cloudap.toml> is required with --dir"))?;
+            let files = list_wordlist_files(dir)?;
+            if files.is_empty() {
+                bail!("no files found in {}", dir.display());
+            }
+            std::fs::create_dir_all(out_dir)?;
+            let mut tables = Vec::with_capacity(files.len());
+            for dictionary in files {
+                let name = dictionary
+                    .file_name()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("wordlist path has no file name: {}", dictionary.display())
+                    })?
+                    .to_string_lossy()
+                    .into_owned();
+                let cache = out_dir.join(format!("{name}.cloudap33700.pim"));
+                if same_target_path(&dictionary, &cache)? {
+                    bail!(
+                        "CloudAP cache {} would overwrite dictionary {}",
+                        cache.display(),
+                        dictionary.display()
+                    );
+                }
+                println!(
+                    "CloudAP KDF cache: {} -> {}",
+                    dictionary.display(),
+                    cache.display()
+                );
+                if cache.exists() && !args.fresh {
+                    match CloudapCache::check(&cache, &dictionary) {
+                        Ok((records, iterations)) if iterations == args.iterations => {
+                            println!("  already complete: {records} candidates; skipping");
+                        }
+                        Ok((_records, iterations)) => bail!(
+                            "{} was built for {iterations} iterations, requested {}; use --fresh",
+                            cache.display(),
+                            args.iterations
+                        ),
+                        Err(error) => bail!(
+                            "existing cache {} failed validation: {error}; use --fresh to rebuild",
+                            cache.display()
+                        ),
+                    }
+                } else {
+                    build_one_cloudap_cache(
+                        &dictionary,
+                        &cache,
+                        args.iterations,
+                        args.threads,
+                        args.fresh,
+                    )?;
+                }
+                tables.push(CloudapTableConfig {
+                    label: name,
+                    cache,
+                    dictionary,
+                });
+            }
+            let config = CloudapConfig { table: tables };
+            if let Some(parent) = config_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            std::fs::write(config_path, toml::to_string_pretty(&config)?)?;
+            println!(
+                "Wrote {} CloudAP cache table(s) to {}.",
+                config.table.len(),
+                config_path.display()
+            );
+            println!(
+                "Scan with: preimage cloudap scan --config {} --target-file cloudap-33700.hash",
+                config_path.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+fn build_one_cloudap_cache(
+    dictionary: &Path,
+    cache: &Path,
+    iterations: u32,
+    threads: usize,
+    fresh: bool,
+) -> Result<()> {
+    let pb = cloudap_build_progress_bar();
+    let stats = CloudapCache::build(dictionary, cache, iterations, threads, fresh, Some(&pb))?;
+    pb.finish_and_clear();
+    println!(
+        "CloudAP cache complete: {} candidates ({} invalid UTF-8 line(s) skipped, {} resumed) -> {}",
+        stats.records,
+        stats.invalid_utf8_lines,
+        stats.resumed_records,
+        cache.display()
+    );
+    Ok(())
+}
+
+fn cmd_cloudap_scan(args: CloudapScanArgs) -> Result<()> {
+    let target_value = match (&args.target, &args.target_file) {
+        (Some(_), Some(_)) => bail!("pass a target argument or --target-file, not both"),
+        (None, None) => bail!("pass a $MSONLINEACCOUNT target or --target-file <file>"),
+        (Some(target), None) => target.clone(),
+        (None, Some(path)) => {
+            let contents = std::fs::read_to_string(path)
+                .with_context(|| format!("read CloudAP target file {}", path.display()))?;
+            let targets: Vec<&str> = contents.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+            if targets.len() != 1 {
+                bail!(
+                    "CloudAP target file {} must contain exactly one non-empty target; found {}",
+                    path.display(),
+                    targets.len()
+                );
+            }
+            targets[0].to_string()
+        }
+    };
+    let target = CloudapTarget::parse(&target_value)?;
+    let limit = if args.all { 0 } else { 1 };
+    match (&args.config, &args.cache, &args.dictionary) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            bail!("use either --config or --cache/--dictionary, not both")
+        }
+        (None, Some(cache), Some(dictionary)) => {
+            let table = CloudapCache::open(cache, dictionary)?;
+            let pb = cloudap_scan_progress_bar();
+            let matches = table.scan(&target, limit, Some(&pb))?;
+            pb.finish_and_clear();
+            if matches.is_empty() {
+                println!("NOT FOUND");
+            } else {
+                for found in matches {
+                    println!("{}", found.plaintext);
+                }
+            }
+            Ok(())
+        }
+        (Some(config_path), None, None) => {
+            let config: CloudapConfig = toml::from_str(&std::fs::read_to_string(config_path)?)?;
+            let mut found_any = false;
+            for table_config in &config.table {
+                let table = CloudapCache::open(&table_config.cache, &table_config.dictionary)?;
+                let pb = cloudap_scan_progress_bar();
+                pb.set_message(table_config.label.clone());
+                let matches = table.scan(&target, limit, Some(&pb))?;
+                pb.finish_and_clear();
+                if !matches.is_empty() {
+                    found_any = true;
+                    for found in matches {
+                        println!("{}\t{}", table_config.label, found.plaintext);
+                    }
+                    if !args.all {
+                        break;
+                    }
+                }
+            }
+            if !found_any {
+                println!("NOT FOUND");
+            }
+            Ok(())
+        }
+        _ => bail!(
+            "provide --config <cloudap.toml>, or both --cache <file> and --dictionary <wordlist>"
+        ),
+    }
+}
+
+fn cmd_cloudap_check(args: CloudapCheckArgs) -> Result<()> {
+    let (records, iterations) = CloudapCache::check(&args.cache, &args.dictionary)?;
+    println!(
+        "CloudAP cache OK: {records} candidates, {iterations} iterations, dictionary binding verified."
+    );
+    Ok(())
+}
+
 fn cmd_lookup(args: LookupArgs) -> Result<()> {
     if args.hashes.is_empty() {
         bail!("No hashes provided. Pass one or more hex-encoded hashes, e.g.:\n  preimage lookup -a md5 -i index.idx -d words.txt 5d41402abc4b2a76b9719d911017c592");
@@ -615,6 +926,18 @@ fn lookup_single(
         }
     }
     Ok(())
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct CloudapConfig {
+    table: Vec<CloudapTableConfig>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct CloudapTableConfig {
+    label: String,
+    cache: PathBuf,
+    dictionary: PathBuf,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]

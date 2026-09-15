@@ -7,6 +7,7 @@
 //! tarball. Cargo follows the symlink and copies the real file in.
 #![doc = include_str!("../README.md")]
 
+pub mod cloudap;
 mod index;
 mod oracle;
 
@@ -19,6 +20,9 @@ pub use allthehashes::*;
 /// mismatch produces a type error about two `ProgressBar`s that look identical.
 pub use indicatif;
 
+pub use cloudap::{
+    CloudapBuildStats, CloudapCache, CloudapMatch, CloudapTarget, DEFAULT_CLOUDAP_ITERATIONS,
+};
 pub use index::entry;
 pub use index::lookup::{LookupMatch, LookupOutcome, LookupTable};
 pub use index::IndexFile;

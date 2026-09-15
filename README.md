@@ -74,8 +74,13 @@ and the tested lookups returned identical results.
   concatenated dictionary/index) and `--mode separate` (one index per file plus a
   generated `tables.toml`). Separate mode validates all intended outputs before
   writing so an index or config cannot overwrite another input/output.
-- **Lookup is unchanged.** No lookup code was modified; measured lookup performance
-  is flat within process/filesystem noise.
+- **CloudAP/33700 KDF cache.** `preimage cloudap` can precompute the unsalted
+  PBKDF2-HMAC-SHA256 work used by Windows CloudAP / Hashcat mode 33700 once per
+  dictionary candidate, then reuse those derived keys against future CacheData
+  targets. Folder builds are per-wordlist, resumable, and incremental; completed
+  caches are skipped on restart.
+- **Lookup is unchanged.** No normal hash lookup code was modified; measured lookup
+  performance is flat within process/filesystem noise.
 
 Install this fork's CLI with:
 
@@ -199,6 +204,95 @@ algorithm = "sha1"
 index = "/data/sha1-small.idx"
 dictionary = "/data/small.txt"
 ```
+
+## CloudAP / Hashcat mode 33700 acceleration
+
+Windows CloudAP CacheData mode 33700 is different from an ordinary hash lookup.
+Current targets derive a 32-byte AES key as:
+
+```text
+PBKDF2-HMAC-SHA256(UTF-16LE(password), salt="", iterations=10000, dkLen=32)
+```
+
+There is no per-target salt, so the expensive PBKDF2 result for a candidate is
+reusable across CloudAP targets. The target does **not** expose that derived key,
+so it cannot use Preimage's normal sorted/binary-search index. Instead,
+`preimage cloudap` stores fixed 38-byte records containing the 32-byte derived key
+plus a 48-bit byte offset into the original dictionary. A target scan streams
+those records and performs only the inexpensive target-specific AES marker check.
+The dictionary is consulted only after a key matches.
+
+Each completed cache is strongly bound to the exact dictionary by size and full
+SHA-256. The build writes `<cache>.part` and flushes progress in bounded windows;
+if interrupted, rerunning the same command repairs any incomplete final record and
+resumes from the last completed candidate. No sort step is required.
+
+### Build one dictionary
+
+```bash
+preimage cloudap build \
+  --wordlist words.txt \
+  --output words.cloudap33700.pim
+```
+
+`--threads 0` (the default) uses every available logical CPU. `--fresh` discards
+both an existing completed cache and any resumable partial build.
+
+### Build a folder incrementally
+
+For the work-server layout used by this fork:
+
+```bash
+preimage cloudap build \
+  --dir /media/raid/wordlists \
+  --out-dir /media/raid/wordlists/pre/cloudap33700 \
+  --config /media/raid/wordlists/pre/cloudap33700.toml
+```
+
+Each regular file directly inside `/media/raid/wordlists` receives its own cache.
+If the command is restarted, valid completed caches are checked and skipped and the
+current `.part` cache resumes. Keeping the caches separate avoids duplicating the
+wordlists into another giant combined dictionary and makes adding a new wordlist
+incremental.
+
+The on-disk cost is 38 bytes per valid UTF-8 candidate plus a 64-byte header. For
+example, one billion candidates require about 38 GB (35.4 GiB) of cache data.
+Lines that are not valid UTF-8 are skipped and counted because the CloudAP KDF is
+defined here over the Unicode password encoded as UTF-16LE.
+
+### Scan a Spectre 33700 target
+
+Single cache:
+
+```bash
+preimage cloudap scan \
+  --cache words.cloudap33700.pim \
+  --dictionary words.txt \
+  '$MSONLINEACCOUNT$0$10000$...'
+```
+
+Folder config, using Spectre's exported `.hash` file directly:
+
+```bash
+preimage cloudap scan \
+  --config /media/raid/wordlists/pre/cloudap33700.toml \
+  --target-file cloudap-33700.hash
+```
+
+`--target-file` requires exactly one non-empty 33700 target. You can alternatively
+pass the `$MSONLINEACCOUNT$0$...` target as a single-quoted positional argument.
+The scan stops at the first match by default; add `--all` to report duplicates
+across all configured dictionaries. Validate a cache/dictionary pair without
+scanning a target with:
+
+```bash
+preimage cloudap check --cache words.cloudap33700.pim --dictionary words.txt
+```
+
+The cache does not contain plaintext passwords, but it contains reusable derived
+key material that substantially reduces the work required to test its dictionary
+against compatible CloudAP targets. Treat it as sensitive cracking material and
+keep it with the protected wordlist/index store.
 
 ## Library
 

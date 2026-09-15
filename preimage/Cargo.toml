@@ -20,6 +20,9 @@ memmap2 = "0.9"
 anyhow = "1"
 indicatif = "0.17"
 hex = "0.4"
+aes = "0.8"
+pbkdf2 = "0.12"
+sha2 = "0.10"
 toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 rand = { version = "0.8", features = ["small_rng"], optional = true }
