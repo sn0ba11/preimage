@@ -15,6 +15,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
 use aes::Aes256;
@@ -31,6 +32,7 @@ const RECORD_SIZE: usize = 38;
 const KEY_SIZE: usize = 32;
 const OFFSET_SIZE: usize = 6;
 const DEFAULT_WINDOW_BYTES: usize = 4 << 20;
+const SCAN_CHUNK_RECORDS: usize = 1 << 16;
 const CLOUDAP_MARKER: &[u8; 8] = b"\x00\x00\x00\x00\x01\x00\x00\x00";
 const MAX_DICTIONARY_OFFSET: u64 = 1u64 << 48;
 
@@ -124,6 +126,13 @@ impl CloudapTarget {
         // first block is exactly AES-ECB decrypt followed by XOR with zero.
         cipher.decrypt_block(&mut block);
         &block[..CLOUDAP_MARKER.len()] == CLOUDAP_MARKER
+    }
+
+    fn verify_derived_key_bytes(&self, key: &[u8]) -> bool {
+        let key: &[u8; KEY_SIZE] = key
+            .try_into()
+            .expect("CloudAP cache key slice has the fixed key size");
+        self.verify_derived_key(key)
     }
 }
 
@@ -446,12 +455,27 @@ impl CloudapCache {
         &self.dictionary_path
     }
 
-    /// Sequentially scan prederived keys against one CloudAP target. `limit == 0`
-    /// returns every match; otherwise scanning stops after `limit` matches.
+    /// Scan prederived keys against one CloudAP target using all available CPU
+    /// threads. `limit == 0` returns every match; otherwise the earliest matches
+    /// in cache order are returned.
     pub fn scan(
         &self,
         target: &CloudapTarget,
         limit: usize,
+        progress: Option<&ProgressBar>,
+    ) -> Result<Vec<CloudapMatch>> {
+        self.scan_with_threads(target, limit, 0, progress)
+    }
+
+    /// Scan with an explicit worker count. `threads == 0` uses all available
+    /// logical CPUs. Work is handed out in bounded, ascending chunks so a
+    /// first-match scan can stop outstanding workers without changing which
+    /// duplicate would have been returned by the former sequential scan.
+    pub fn scan_with_threads(
+        &self,
+        target: &CloudapTarget,
+        limit: usize,
+        threads: usize,
         progress: Option<&ProgressBar>,
     ) -> Result<Vec<CloudapMatch>> {
         if target.iterations != self.header.iterations {
@@ -469,35 +493,88 @@ impl CloudapCache {
         let records = &self.cache_mmap[HEADER_SIZE..];
         let record_count = usize::try_from(self.header.record_count)
             .context("CloudAP record count does not fit this platform")?;
-        let mut matches = Vec::new();
-        for index in 0..record_count {
-            let start = index * RECORD_SIZE;
-            let record = &records[start..start + RECORD_SIZE];
-            let mut key = [0u8; KEY_SIZE];
-            key.copy_from_slice(&record[..KEY_SIZE]);
-            if target.verify_derived_key(&key) {
-                let offset = decode_offset(&record[KEY_SIZE..KEY_SIZE + OFFSET_SIZE]);
-                let dictionary = self
-                    .dictionary_mmap
-                    .as_deref()
-                    .context("CloudAP cache matched a key but its dictionary is empty")?;
-                let plaintext = dictionary_word(dictionary, offset)?;
-                matches.push(CloudapMatch {
-                    dictionary_offset: offset,
-                    plaintext,
-                });
-                if limit != 0 && matches.len() >= limit {
-                    if let Some(pb) = progress {
-                        pb.set_position(index as u64 + 1);
-                    }
-                    break;
-                }
-            }
-            if let Some(pb) = progress {
-                if index & 0x3fff == 0 {
-                    pb.set_position(index as u64 + 1);
-                }
-            }
+        if record_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let requested_threads = if threads == 0 {
+            std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1)
+        } else {
+            threads.max(1)
+        };
+        let worker_count = requested_threads.min(record_count);
+        let next_chunk = AtomicUsize::new(0);
+        let best_match = AtomicUsize::new(usize::MAX);
+
+        let mut indexed_matches = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..worker_count)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut local_matches = Vec::new();
+                        loop {
+                            let start = next_chunk.fetch_add(SCAN_CHUNK_RECORDS, Ordering::Relaxed);
+                            if start >= record_count
+                                || (limit == 1
+                                    && start >= best_match.load(Ordering::Relaxed))
+                            {
+                                break;
+                            }
+                            let end = (start + SCAN_CHUNK_RECORDS).min(record_count);
+                            let mut scanned = 0u64;
+                            for index in start..end {
+                                if limit == 1 && index >= best_match.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                let record_start = index * RECORD_SIZE;
+                                let record =
+                                    &records[record_start..record_start + RECORD_SIZE];
+                                scanned += 1;
+                                if target.verify_derived_key_bytes(&record[..KEY_SIZE]) {
+                                    let offset = decode_offset(
+                                        &record[KEY_SIZE..KEY_SIZE + OFFSET_SIZE],
+                                    );
+                                    local_matches.push((index, offset));
+                                    if limit == 1 {
+                                        best_match.fetch_min(index, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(pb) = progress {
+                                pb.inc(scanned);
+                            }
+                        }
+                        local_matches
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| {
+                    handle
+                        .join()
+                        .expect("CloudAP scan worker panicked")
+                })
+                .collect::<Vec<_>>()
+        });
+        indexed_matches.sort_unstable_by_key(|&(index, _)| index);
+        if limit != 0 {
+            indexed_matches.truncate(limit);
+        } else if let Some(pb) = progress {
+            pb.set_position(self.header.record_count);
+        }
+
+        let dictionary = self.dictionary_mmap.as_deref();
+        let mut matches = Vec::with_capacity(indexed_matches.len());
+        for (_, offset) in indexed_matches {
+            let dictionary = dictionary
+                .context("CloudAP cache matched a key but its dictionary is empty")?;
+            matches.push(CloudapMatch {
+                dictionary_offset: offset,
+                plaintext: dictionary_word(dictionary, offset)?,
+            });
         }
         Ok(matches)
     }
@@ -916,6 +993,16 @@ mod tests {
     use aes::cipher::{BlockEncrypt, KeyInit};
     use tempfile::tempdir;
 
+    fn derived_key(password: &str, iterations: u32) -> [u8; KEY_SIZE] {
+        let mut utf16 = Vec::new();
+        for unit in password.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        let mut key = [0u8; KEY_SIZE];
+        pbkdf2_hmac::<Sha256>(&utf16, b"", iterations, &mut key);
+        key
+    }
+
     fn target_for(password: &str, iterations: u32) -> String {
         let mut utf16 = Vec::new();
         for unit in password.encode_utf16() {
@@ -960,6 +1047,58 @@ mod tests {
         pbkdf2_hmac::<Sha256>(&utf16, b"", 8, &mut good);
         assert!(target.verify_derived_key(&good));
         assert!(!target.verify_derived_key(&[0u8; 32]));
+    }
+
+    #[test]
+    fn parallel_scan_preserves_cache_order_and_limit() {
+        let dir = tempdir().unwrap();
+        let words = dir.path().join("words.txt");
+        let cache = dir.path().join("cloudap33700.pim");
+        let dictionary = b"CorrectHorse\nwrong\nCorrectHorse\n";
+        std::fs::write(&words, dictionary).unwrap();
+
+        let iterations = 8;
+        let correct = derived_key("CorrectHorse", iterations);
+        let wrong = derived_key("wrong", iterations);
+        let second_correct_offset = b"CorrectHorse\nwrong\n".len() as u64;
+        let record_count = SCAN_CHUNK_RECORDS * 2;
+        let first_match = SCAN_CHUNK_RECORDS - 1;
+        let second_match = SCAN_CHUNK_RECORDS;
+        let header = Header {
+            iterations,
+            dictionary_len: dictionary.len() as u64,
+            dictionary_sha256: Sha256::digest(dictionary).into(),
+            record_count: record_count as u64,
+        };
+        let mut bytes = Vec::with_capacity(HEADER_SIZE + record_count * RECORD_SIZE);
+        bytes.extend_from_slice(&header.encode());
+        for index in 0..record_count {
+            bytes.extend_from_slice(if index == first_match || index == second_match {
+                &correct
+            } else {
+                &wrong
+            });
+            encode_offset(
+                if index == second_match {
+                    second_correct_offset
+                } else {
+                    0
+                },
+                &mut bytes,
+            );
+        }
+        std::fs::write(&cache, bytes).unwrap();
+
+        let opened = CloudapCache::open(&cache, &words).unwrap();
+        let target = CloudapTarget::parse(&target_for("CorrectHorse", iterations)).unwrap();
+        let first = opened.scan_with_threads(&target, 1, 4, None).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].dictionary_offset, 0);
+
+        let all = opened.scan_with_threads(&target, 0, 4, None).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].dictionary_offset, 0);
+        assert_eq!(all[1].dictionary_offset, second_correct_offset);
     }
 
     #[test]

@@ -179,6 +179,9 @@ struct CloudapScanArgs {
     /// Return every matching duplicate instead of stopping at the first hit
     #[arg(long)]
     all: bool,
+    /// Scan worker threads; 0 uses all available logical CPUs
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
     /// `$MSONLINEACCOUNT$0$...` mode-33700 target (omit when using --target-file)
     target: Option<String>,
 }
@@ -851,7 +854,7 @@ fn cmd_cloudap_scan(args: CloudapScanArgs) -> Result<()> {
         (None, Some(cache), Some(dictionary)) => {
             let table = CloudapCache::open(cache, dictionary)?;
             let pb = cloudap_scan_progress_bar();
-            let matches = table.scan(&target, limit, Some(&pb))?;
+            let matches = table.scan_with_threads(&target, limit, args.threads, Some(&pb))?;
             pb.finish_and_clear();
             if matches.is_empty() {
                 println!("NOT FOUND");
@@ -869,7 +872,8 @@ fn cmd_cloudap_scan(args: CloudapScanArgs) -> Result<()> {
                 let table = CloudapCache::open(&table_config.cache, &table_config.dictionary)?;
                 let pb = cloudap_scan_progress_bar();
                 pb.set_message(table_config.label.clone());
-                let matches = table.scan(&target, limit, Some(&pb))?;
+                let matches =
+                    table.scan_with_threads(&target, limit, args.threads, Some(&pb))?;
                 pb.finish_and_clear();
                 if !matches.is_empty() {
                     found_any = true;

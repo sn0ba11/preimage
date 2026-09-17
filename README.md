@@ -262,6 +262,7 @@ On an RTX 3070, a sustained 262,144-candidate CUDA validation batch measured
 the CPU-produced cache, including Unicode and long-password test cases. At that
 rate, the 15.4-million-line benchmark corpus described above spends roughly two
 minutes in the KDF; actual ingest also includes dictionary hashing and cache I/O.
+The CUDA build rate is therefore already within 1% of Hashcat on that GPU.
 
 ### Build a folder incrementally
 
@@ -307,12 +308,20 @@ preimage cloudap scan \
 `--target-file` requires exactly one non-empty 33700 target. You can alternatively
 pass the `$MSONLINEACCOUNT$0$...` target as a single-quoted positional argument.
 The scan stops at the first match by default; add `--all` to report duplicates
-across all configured dictionaries. Validate a cache/dictionary pair without
+across all configured dictionaries. Scans use every available logical CPU by
+default because the target-specific AES checks parallelize independently; use
+`--threads 1` when the cache is on rotational storage or to reproduce the former
+sequential access pattern. Validate a cache/dictionary pair without
 scanning a target with:
 
 ```bash
 preimage cloudap check --cache words.cloudap33700.pim --dictionary words.txt
 ```
+
+On the same 20-thread Core i5-14600T used for the index benchmarks, a release build
+scanned a warm 10-million-record / 362 MiB cache with no matching target in 0.16s
+using the default 20 threads versus 0.97s with `--threads 1`, a 6.1x reduction in
+wall time. Both measurements include validation of the paired 153 MiB dictionary.
 
 The cache does not contain plaintext passwords, but it contains reusable derived
 key material that substantially reduces the work required to test its dictionary
