@@ -6,8 +6,12 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(preimage_cuda)");
     println!("cargo:rerun-if-changed=src/cloudap_cuda.cu");
     println!("cargo:rerun-if-env-changed=NVCC");
+    println!("cargo:rerun-if-env-changed=PREIMAGE_REQUIRE_CUDA");
 
     let Some(nvcc) = find_nvcc() else {
+        if env_flag("PREIMAGE_REQUIRE_CUDA") {
+            panic!("PREIMAGE_REQUIRE_CUDA is set but nvcc was not found; refusing to build a CPU-only binary");
+        }
         return;
     };
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
@@ -41,6 +45,17 @@ fn main() {
             }
         }
     }
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn find_nvcc() -> Option<PathBuf> {

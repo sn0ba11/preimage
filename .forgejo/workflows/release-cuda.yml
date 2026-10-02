@@ -1,0 +1,91 @@
+name: Release CUDA binary
+
+on:
+  push:
+    tags:
+      - "v*-cuda"
+  workflow_dispatch:
+
+jobs:
+  linux-cuda:
+    runs-on: docker
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out Preimage
+        uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Build CUDA release
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist-cuda target-forgejo-cuda
+          docker run --rm \
+            -e PREIMAGE_REQUIRE_CUDA=1 \
+            -e CARGO_TARGET_DIR=/work/target-forgejo-cuda \
+            -v "$PWD:/work" \
+            -w /work \
+            nvidia/cuda:12.4.1-devel-ubuntu22.04 \
+            bash -lc '
+              set -euo pipefail
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                build-essential ca-certificates curl
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable
+              export PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH
+              nvcc --version
+              cargo build --release -p preimage
+              ldd target-forgejo-cuda/release/preimage | grep "libcudart.so.12"
+              mkdir -p dist-cuda/package
+              cp target-forgejo-cuda/release/preimage README.md LICENSE-APACHE LICENSE-MIT dist-cuda/package/
+              tar -C dist-cuda/package -czf dist-cuda/preimage-linux-x86_64-cuda12.tar.gz \
+                preimage README.md LICENSE-APACHE LICENSE-MIT
+              sha256sum dist-cuda/preimage-linux-x86_64-cuda12.tar.gz \
+                > dist-cuda/preimage-linux-x86_64-cuda12.tar.gz.sha256
+            '
+
+      - name: Upload workflow artifact
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: preimage-linux-x86_64-cuda12
+          if-no-files-found: error
+          path: |
+            dist-cuda/preimage-linux-x86_64-cuda12.tar.gz
+            dist-cuda/preimage-linux-x86_64-cuda12.tar.gz.sha256
+
+      - name: Publish Forgejo release
+        if: startsWith(forgejo.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e FORGEJO_TOKEN \
+            -e FORGEJO_API_URL \
+            -e FORGEJO_REPOSITORY \
+            -e FORGEJO_REF_NAME \
+            -e FORGEJO_SHA \
+            -v "$PWD:/work" \
+            -w /work \
+            alpine:3.22 sh -lc '
+              set -euo pipefail
+              apk add --no-cache curl jq >/dev/null
+              auth="Authorization: token $FORGEJO_TOKEN"
+              release_url="$FORGEJO_API_URL/repos/$FORGEJO_REPOSITORY/releases"
+              release_json="$(curl -fsS -H "$auth" "$release_url/tags/$FORGEJO_REF_NAME" 2>/dev/null || true)"
+              if [ -z "$release_json" ]; then
+                payload="$(jq -nc \
+                  --arg tag "$FORGEJO_REF_NAME" \
+                  --arg sha "$FORGEJO_SHA" \
+                  "{tag_name:\$tag,target_commitish:\$sha,name:(\"Preimage \" + \$tag),body:\"CUDA 12.4 Linux x86-64 build with CloudAP / Microsoft Online mode 33700 acceleration. The build fails closed if nvcc is unavailable.\",draft:false,prerelease:false}")"
+                release_json="$(printf "%s" "$payload" | curl -fsS -H "$auth" -H "Content-Type: application/json" -X POST --data-binary @- "$release_url")"
+              fi
+              release_id="$(printf "%s" "$release_json" | jq -er ".id")"
+              for asset in dist-cuda/preimage-linux-x86_64-cuda12.tar.gz dist-cuda/preimage-linux-x86_64-cuda12.tar.gz.sha256; do
+                name="$(basename "$asset")"
+                curl -fsS -H "$auth" -X POST -F "attachment=@$asset" \
+                  "$release_url/$release_id/assets?name=$name" >/dev/null
+              done
+            '
