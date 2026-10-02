@@ -1121,6 +1121,39 @@ mod tests {
     }
 
     #[test]
+    fn opens_writer_independent_v1_fixture() {
+        let dir = tempdir().unwrap();
+        let words = dir.path().join("words.txt");
+        let cache = dir.path().join("legacy-v1.pim");
+        let dictionary = b"CorrectHorse\n";
+        std::fs::write(&words, dictionary).unwrap();
+
+        // Deliberately assemble the v1 bytes by hand instead of calling Header::encode()
+        // or the current builder. This pins compatibility with the legacy on-disk layout
+        // even if the writer changes when v2 support is added.
+        let iterations = 8u32;
+        let mut bytes = Vec::with_capacity(HEADER_SIZE + RECORD_SIZE);
+        bytes.extend_from_slice(b"PIMC337\0");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&iterations.to_le_bytes());
+        bytes.extend_from_slice(&(dictionary.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&Sha256::digest(dictionary));
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&derived_key("CorrectHorse", iterations));
+        bytes.extend_from_slice(&[0u8; 6]);
+        assert_eq!(bytes.len(), 64 + 38);
+        std::fs::write(&cache, bytes).unwrap();
+
+        let opened = CloudapCache::open(&cache, &words).unwrap();
+        assert_eq!(opened.record_count(), 1);
+        let target = CloudapTarget::parse(&target_for("CorrectHorse", iterations)).unwrap();
+        let found = opened.scan(&target, 1, None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].dictionary_offset, 0);
+        assert_eq!(found[0].plaintext, "CorrectHorse");
+    }
+
+    #[test]
     fn parallel_scan_preserves_cache_order_and_limit() {
         let dir = tempdir().unwrap();
         let words = dir.path().join("words.txt");

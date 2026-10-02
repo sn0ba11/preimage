@@ -1,0 +1,243 @@
+# Preimage Storage Optimisation Handover
+
+Date: 2026-10-02
+
+## Context
+
+Preimage is now proven working for:
+- NTLM
+- MSOnline / CloudAP mode 33700
+
+Both workflows use the same deduplicated production dictionary.
+
+The immediate goal is to reduce the complete production data footprint from ~702.43 GiB to below 500 GB if practical, without sacrificing candidate coverage or materially reducing speed.
+
+## Exact production figures
+
+Dictionary:
+- file: `bigdict.txt`
+- size: **136,291,884,307 bytes**
+- candidates: **11,901,699,218**
+- already deduplicated
+
+NTLM index:
+- file: `bigdictsntlm.idx`
+- size: **166,366,525,626 bytes**
+- current entry format: 8-byte hash prefix + 6-byte dictionary byte offset = 14 bytes
+
+MSOnline/CloudAP PIM:
+- file: `bigdict.msonline.pim`
+- size: **451,566,283,906 bytes**
+- current record format: 32-byte derived key + 6-byte dictionary byte offset = 38 bytes
+
+Total:
+- **754,224,693,839 bytes**
+- approximately **702.43 GiB**
+
+## Measured compression result
+
+A real Windows NTFS LZX compression pass completed on the PIM.
+
+Results:
+- PIM approximately **1.1:1**
+- Dictionary approximately **5:1**
+- Full dataset approximately **1.4:1**
+- Final allocated size: **550,005,972,992 bytes (~512.24 GiB)**
+- Saving versus logical dataset: **204,218,720,847 bytes (~204.22 GB, ~27.1%)**
+- Remaining gap to <500 GB decimal: **50,005,972,992 bytes (~50.01 GB)**
+
+Conclusion:
+- PIM/IDX contain mostly high-entropy cryptographic material, so binary-cache format redesign is still useful
+- the dictionary compresses extremely well
+- the completed LZX result means the Windows SpectreDemo deployment is already close to the target; the easy v2 reductions may be sufficient without requiring the most aggressive succinct-index design
+
+## Important performance baseline
+
+On Comino, the current ~451 GB PIM scans in approximately **2 minutes**.
+
+That is around **3.8 GB/s effective scan/read throughput**.
+
+Do not merge a storage optimisation that materially regresses this without explicit justification.
+
+## Start here — easy work for Claude
+
+The first implementation target is **PIM v2**.
+
+### PIM v2 design
+
+Current:
+```text
+32-byte derived key
+6-byte dictionary byte offset
+= 38 bytes/record
+```
+
+v2:
+```text
+32-byte derived key only
+= 32 bytes/record
+```
+
+The candidate ordinal is implied by the record position.
+
+Important production detail:
+- Dictionary lines: **11,901,699,218**
+- PIM records inferred exactly from the current file: **11,883,323,259**
+- Difference: **18,375,959**
+
+The current PIM therefore does not contain one record for every dictionary line. Source review shows the CloudAP build path skips invalid-UTF8 lines while valid empty lines still produce records. Treat invalid UTF-8 as the leading explanation for the 18,375,959 delta, but confirm it with whole-input accounting before relying on it. A resumed build's final log cannot by itself prove the total because its invalid-UTF8 counter is invocation-local.
+
+For the same 11,883,323,259 records, v2 size is:
+- **380,266,344,352 bytes including the 64-byte header**
+- **354.15 GiB**
+
+This saves **71,299,939,554 bytes (~71.30 GB decimal)**, about **15.8%** of the current PIM.
+
+### Why this works
+
+The CloudAP cache is generated in dictionary order.
+
+Do **not** define record N as raw dictionary line N. Define it as the N-th **accepted CloudAP candidate** (valid UTF-8 under the current semantics).
+
+The intended v2 design remains to remove the byte offset. The sparse sidecar must therefore map accepted-candidate ordinal → dictionary byte offset and skip invalid-UTF8 lines during forward resolution.
+
+After a hit, Preimage can resolve ordinal N back to plaintext through a sparse dictionary index.
+
+The ordinal lookup is not part of the full scan hot path.
+
+### Implementation order
+
+1. Record/reconcile production counts, provenance and reproducible performance baselines.
+2. Inventory and strengthen existing v1 compatibility evidence.
+3. Implement the easy 5-byte-offset IDX v2 as an independent low-risk win.
+4. Add the sparse accepted-candidate-ordinal sidecar.
+5. Introduce explicit PIM v2 version handling.
+6. Make v2 records exactly 32 bytes and update scan/check paths.
+7. Update CPU and CUDA builders for v2.
+8. Update resume/torn-record repair to use the sidecar rather than rescanning the full dictionary.
+9. Test CPU/CUDA byte identity and cross-backend resume, including >64-byte UTF-16 HMAC keys.
+10. Benchmark v1 vs v2.
+
+Do not remove v1 support.
+
+## Sparse dictionary ordinal index
+
+First version should be simple, not clever.
+
+Store checkpoints every K accepted CloudAP candidates:
+
+```text
+PIM record ordinal -> dictionary byte offset
+```
+
+To resolve hit N:
+- jump to checkpoint <= N
+- seek to its byte offset
+- scan forward a bounded range
+- skip invalid-UTF8 lines while counting accepted candidates
+- return accepted candidate N
+
+This is intentionally off the hot path.
+
+Do not create a full 11.9B-entry offset table.
+
+## Dictionary compression work
+
+The dictionary is likely the best compression candidate because it is text.
+
+Do not replace it with a monolithic `.zst`.
+
+Instead prototype a seekable block-compressed format after the basic PIM v2 work is stable.
+
+Suggested:
+- zstd blocks
+- each block owns a known ordinal range
+- block table maps ordinals to compressed offsets
+- optional small LRU decompression cache
+
+A full PIM miss scan must not decompress dictionary blocks.
+
+The production dictionary has now measured about **5:1** under NTFS LZX. Still benchmark portable zstd block sizes (for example 64 KiB / 256 KiB / 1 MiB uncompressed) for both ratio and one-block decompression latency before choosing the canonical portable format. Design the block table to reuse the ordinal sidecar mapping where practical.
+
+## NTLM work
+
+There is now one easy NTLM task worth doing early: **5-byte offsets**. The dictionary's largest byte offset fits in 37 bits, so a 40-bit/5-byte offset is sufficient. Changing IDX from 14-byte entries to 13-byte entries saves about **11.88 GB decimal** at the current 11,883,323,259-record count without changing sort order or lookup semantics. Keep v1 reader support and audit the packed/unsafe bulk I/O assumptions.
+
+The deeper NTLM redesign remains harder.
+
+The NTLM redesign is harder.
+
+Current index:
+- 8-byte sorted prefix
+- 6-byte dictionary byte offset
+
+The index is hash-sorted, so record position does not naturally equal dictionary ordinal.
+
+The dictionary has 11,901,699,218 entries, therefore:
+- 32-bit candidate IDs do not fit
+- at least 34 bits are required for ordinals
+- current byte offsets fit in 37 bits, making a 5-byte offset an immediate safe format reduction
+
+Candidate ideas documented in `ROADMAP.md`:
+- dictionary reordered into NTLM order
+- separate compressed ordinal mapping
+- Elias–Fano / succinct sorted prefix representation
+- 56-bit prefixes with mandatory full NTLM verification
+
+Do not destructively reorder the production dictionary at this stage.
+
+## Compatibility requirements
+
+- v1 PIM must remain readable
+- v1 IDX must remain readable
+- v2 files need explicit versioning
+- no silent interpretation of one format as another
+- production v1 data remains the fallback until v2 checks pass
+- treat one complete dataset generation as the deployable unit, identified by a manifest containing versions, lengths, trusted digests, producer revision, dictionary identity and validation status
+- failed migration must leave the previous validated generation usable
+
+## Correctness tests
+
+Do not treat one successful `check` as proving everything. Keep structural validity, dictionary identity, artifact integrity, completeness and behavioural compatibility as separate validation claims.
+
+For both v1 and v2:
+- known NTLM hit
+- known NTLM miss
+- known CloudAP hit
+- known CloudAP miss
+- first/middle/last candidate resolution
+- final dictionary line with and without newline
+- interrupted PIM build resume
+- CPU-to-CUDA and CUDA-to-CPU resume where supported
+- corruption/truncation checks
+
+## Performance gates
+
+CloudAP:
+- current full PIM scan on Comino: ~2 minutes
+- v2 should be neutral or faster
+
+NTLM:
+- current lookup should remain effectively interactive
+
+Dictionary:
+- decompression/resolution must remain off scan hot paths
+
+USB HDD:
+- reduced file size should improve wall-clock performance because storage bandwidth becomes the bottleneck
+
+## Files added for this work
+
+- `TASK_REGISTER.md` — concrete work items and acceptance criteria
+- `ROADMAP.md` — design rationale, size model, and future options
+- `HANDOVER.md` — this implementation handover
+
+## Recommended first Claude task
+
+Start with PRE-001 and PRE-002:
+- reconcile counts/provenance and record a reproducible baseline
+- inventory and strengthen the existing compatibility evidence
+
+Then implement the low-risk 5-byte-offset IDX v2, followed by PRE-011 and the 32-byte PIM v2/resume work.
+
+Do not jump into the succinct NTLM work until the easy v2 reductions are proven and benchmarked.
