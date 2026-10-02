@@ -1,9 +1,11 @@
 use std::cmp::Ordering;
 use std::io::{Read, Write};
 
+use super::format::{IndexFormat, V1_ENTRY_SIZE, V1_POSITION_LEN};
+
 pub const HASH_PREFIX_LEN: usize = 8;
-pub const POSITION_LEN: usize = 6;
-pub const ENTRY_SIZE: usize = HASH_PREFIX_LEN + POSITION_LEN;
+pub const POSITION_LEN: usize = V1_POSITION_LEN;
+pub const ENTRY_SIZE: usize = V1_ENTRY_SIZE;
 
 /// Maximum position value that fits in 48 bits.
 const MAX_POSITION: u64 = 0xFFFF_FFFF_FFFF;
@@ -99,23 +101,52 @@ impl IndexEntry {
         a_hp.cmp(&b_hp)
     }
 
-    /// Read a single entry from a reader.
+    /// Read a single legacy-v1 entry from a reader.
     pub fn read_from(reader: &mut impl Read) -> std::io::Result<Self> {
+        Self::read_from_format(reader, IndexFormat::LegacyV1)
+    }
+
+    /// Read one entry in the requested on-disk format into the canonical in-memory
+    /// representation. Compact v2 stores only five position bytes; the sixth canonical
+    /// byte is zero-filled.
+    pub fn read_from_format(
+        reader: &mut impl Read,
+        format: IndexFormat,
+    ) -> std::io::Result<Self> {
         let mut entry = Self {
             hash_prefix: [0; HASH_PREFIX_LEN],
             position: [0; POSITION_LEN],
         };
         reader.read_exact(&mut entry.hash_prefix)?;
-        reader.read_exact(&mut entry.position)?;
+        reader.read_exact(&mut entry.position[..format.position_len()])?;
         Ok(entry)
     }
 
-    /// Write a single entry to a writer.
+    /// Write a single legacy-v1 entry to a writer.
     pub fn write_to(&self, writer: &mut impl Write) -> std::io::Result<()> {
+        self.write_to_format(writer, IndexFormat::LegacyV1)
+    }
+
+    /// Write one entry in the requested on-disk format.
+    pub fn write_to_format(
+        &self,
+        writer: &mut impl Write,
+        format: IndexFormat,
+    ) -> std::io::Result<()> {
+        let position = self.position();
+        if position > format.max_position() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "dictionary position {position} exceeds {}-byte index format maximum {}",
+                    format.position_len(),
+                    format.max_position()
+                ),
+            ));
+        }
         let hp = self.hash_prefix;
-        let pos = self.position;
         writer.write_all(&hp)?;
-        writer.write_all(&pos)?;
+        writer.write_all(&self.position[..format.position_len()])?;
         Ok(())
     }
 
@@ -167,6 +198,31 @@ impl IndexEntry {
     ///
     /// Panics if `count > buf.len()`, for the same reason as `read_bulk`.
     pub fn write_bulk(writer: &mut impl Write, buf: &[Self], count: usize) -> std::io::Result<()> {
+        Self::write_bulk_format(writer, buf, count, IndexFormat::LegacyV1)
+    }
+
+    pub fn read_bulk_format(
+        reader: &mut impl Read,
+        buf: &mut [Self],
+        count: usize,
+        format: IndexFormat,
+    ) -> std::io::Result<()> {
+        if format == IndexFormat::LegacyV1 {
+            return Self::read_bulk(reader, buf, count);
+        }
+        assert!(count <= buf.len());
+        for entry in &mut buf[..count] {
+            *entry = Self::read_from_format(reader, format)?;
+        }
+        Ok(())
+    }
+
+    pub fn write_bulk_format(
+        writer: &mut impl Write,
+        buf: &[Self],
+        count: usize,
+        format: IndexFormat,
+    ) -> std::io::Result<()> {
         assert!(
             count <= buf.len(),
             "count {count} exceeds buffer length {}",
@@ -175,14 +231,21 @@ impl IndexEntry {
         if count == 0 {
             return Ok(());
         }
-        let byte_len = count * ENTRY_SIZE;
-        // SAFETY: as in `read_bulk`, but shared rather than exclusive. `byte_len` is
-        // within the allocation because the `const _` assertion pins
-        // `size_of::<IndexEntry>()` to `ENTRY_SIZE` at compile time and the assert above
-        // bounds `count` by `buf.len()`; `[u8]` needs alignment 1; and `buf` is a shared
-        // borrow, so no `&mut` to these bytes can exist while this slice does.
-        let byte_slice = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, byte_len) };
-        writer.write_all(byte_slice)
+        if format == IndexFormat::LegacyV1 {
+            let byte_len = count * ENTRY_SIZE;
+            // SAFETY: as in `read_bulk`, but shared rather than exclusive. `byte_len` is
+            // within the allocation because the `const _` assertion pins
+            // `size_of::<IndexEntry>()` to `ENTRY_SIZE` at compile time and the assert above
+            // bounds `count` by `buf.len()`; `[u8]` needs alignment 1; and `buf` is a shared
+            // borrow, so no `&mut` to these bytes can exist while this slice does.
+            let byte_slice =
+                unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, byte_len) };
+            return writer.write_all(byte_slice);
+        }
+        for entry in &buf[..count] {
+            entry.write_to_format(writer, format)?;
+        }
+        Ok(())
     }
 }
 

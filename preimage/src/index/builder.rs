@@ -5,6 +5,7 @@ use indicatif::ProgressBar;
 use memmap2::Mmap;
 
 use super::entry::IndexEntry;
+use super::format::IndexFormat;
 use crate::HashAlgorithm;
 
 impl super::IndexFile {
@@ -20,6 +21,36 @@ impl super::IndexFile {
         progress: Option<&ProgressBar>,
     ) -> Result<Self> {
         IndexBuilder::build(algorithm, wordlist_path, output_path, progress)?;
+        Ok(super::IndexFile {
+            path: output_path.to_path_buf(),
+        })
+    }
+
+    /// Create a compact-v2 unsorted index with a versioned header and 5-byte
+    /// dictionary positions. Legacy `build` remains byte-for-byte v1.
+    pub fn build_compact(
+        algorithm: &dyn HashAlgorithm,
+        wordlist_path: &Path,
+        output_path: &Path,
+        progress: Option<&ProgressBar>,
+    ) -> Result<Self> {
+        Self::build_with_format(
+            algorithm,
+            wordlist_path,
+            output_path,
+            IndexFormat::CompactV2,
+            progress,
+        )
+    }
+
+    fn build_with_format(
+        algorithm: &dyn HashAlgorithm,
+        wordlist_path: &Path,
+        output_path: &Path,
+        format: IndexFormat,
+        progress: Option<&ProgressBar>,
+    ) -> Result<Self> {
+        IndexBuilder::build_with_format(algorithm, wordlist_path, output_path, format, progress)?;
         Ok(super::IndexFile {
             path: output_path.to_path_buf(),
         })
@@ -47,6 +78,22 @@ impl IndexBuilder {
         output_path: &Path,
         progress: Option<&ProgressBar>,
     ) -> Result<u64> {
+        Self::build_with_format(
+            algorithm,
+            wordlist_path,
+            output_path,
+            IndexFormat::LegacyV1,
+            progress,
+        )
+    }
+
+    pub fn build_with_format(
+        algorithm: &dyn HashAlgorithm,
+        wordlist_path: &Path,
+        output_path: &Path,
+        format: IndexFormat,
+        progress: Option<&ProgressBar>,
+    ) -> Result<u64> {
         let wordlist = std::fs::File::open(wordlist_path)?;
         let file_len = wordlist.metadata()?.len();
 
@@ -62,6 +109,7 @@ impl IndexBuilder {
         }
 
         let mut output = std::fs::File::create(output_path)?;
+        format.write_header(&mut output)?;
 
         if let Some(pb) = progress {
             pb.set_length(file_len);
@@ -109,7 +157,7 @@ impl IndexBuilder {
                 let mut count = 0u64;
                 for handle in handles {
                     let entries = handle.join().expect("hash worker panicked");
-                    IndexEntry::write_bulk(&mut output, &entries, entries.len())?;
+                    IndexEntry::write_bulk_format(&mut output, &entries, entries.len(), format)?;
                     count += entries.len() as u64;
                 }
                 Ok(count)

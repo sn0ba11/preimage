@@ -161,7 +161,7 @@ The production dictionary has now measured about **5:1** under NTFS LZX. Still b
 
 ## NTLM work
 
-There is now one easy NTLM task worth doing early: **5-byte offsets**. The dictionary's largest byte offset fits in 37 bits, so a 40-bit/5-byte offset is sufficient. Changing IDX from 14-byte entries to 13-byte entries saves about **11.88 GB decimal** at the current 11,883,323,259-record count without changing sort order or lookup semantics. Keep v1 reader support and audit the packed/unsafe bulk I/O assumptions.
+The easy NTLM 5-byte-offset task is now **implemented** as IDX2. It uses a 24-byte explicit header and 13-byte entries, is created with `--compact-index`, and is understood by build/sort/check/mmap lookup. Legacy headerless v1 remains the default/readable format. At the current record count the projected production saving is **11,883,323,235 bytes (~11.88 GB decimal)**. Full workspace tests pass, including a real external-merge IDX2 header-preservation test. Production-scale throughput still needs benchmarking before IDX2 becomes the default.
 
 The deeper NTLM redesign remains harder.
 
@@ -238,6 +238,6 @@ Start with PRE-001 and PRE-002:
 - reconcile counts/provenance and record a reproducible baseline
 - inventory and strengthen the existing compatibility evidence
 
-Then implement the low-risk 5-byte-offset IDX v2, followed by PRE-011 and the 32-byte PIM v2/resume work.
+PRE-029 (5-byte-offset IDX2) is complete. The next task is PRE-011: the accepted-candidate ordinal sidecar needed by PIM v2 and fast resume. That is the first genuinely moderate item after the completed easy wins.
 
 Do not jump into the succinct NTLM work until the easy v2 reductions are proven and benchmarked.

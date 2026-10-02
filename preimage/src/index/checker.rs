@@ -4,7 +4,8 @@ use std::path::Path;
 use anyhow::Result;
 use indicatif::ProgressBar;
 
-use super::entry::{IndexEntry, ENTRY_SIZE};
+use super::entry::IndexEntry;
+use super::format::IndexFormat;
 
 impl super::IndexFile {
     /// Check whether the index file is sorted by hash prefix.
@@ -18,31 +19,27 @@ impl super::IndexFile {
 /// Returns `true` if every entry's hash prefix is >= the previous entry's.
 /// Returns `false` if any out-of-order pair is found.
 pub fn check_sorted(index_path: &Path, progress: Option<&ProgressBar>) -> Result<bool> {
-    let file = std::fs::File::open(index_path)?;
+    let mut file = std::fs::File::open(index_path)?;
     let file_size = file.metadata()?.len();
 
     if file_size == 0 {
         return Ok(true);
     }
 
-    if file_size % ENTRY_SIZE as u64 != 0 {
-        anyhow::bail!(
-            "index file size {} is not a multiple of entry size {}",
-            file_size,
-            ENTRY_SIZE
-        );
+    let format = IndexFormat::detect_reader(&mut file, file_size)?;
+    let num_entries = format.entry_count_for_size(file_size)?;
+    if num_entries == 0 {
+        return Ok(true);
     }
-
-    let num_entries = file_size / ENTRY_SIZE as u64;
     if let Some(pb) = progress {
         pb.set_length(num_entries);
     }
 
     let mut reader = BufReader::new(file);
-    let mut prev = IndexEntry::read_from(&mut reader)?;
+    let mut prev = IndexEntry::read_from_format(&mut reader, format)?;
 
     for i in 1..num_entries {
-        let current = IndexEntry::read_from(&mut reader)?;
+        let current = IndexEntry::read_from_format(&mut reader, format)?;
         if current.compare_prefix(&prev) == std::cmp::Ordering::Less {
             return Ok(false);
         }

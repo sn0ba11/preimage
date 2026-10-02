@@ -135,8 +135,12 @@ no way to default differently per target.
 ## Command line
 
 ```bash
-# 1. Create an unsorted index from a wordlist
+# 1. Create an unsorted legacy-v1 index from a wordlist
 preimage create -a md5 -w wordlist.txt -o md5.idx
+
+# Or create compact IDX2: 24-byte versioned header + 13-byte entries
+# (8-byte hash prefix + 5-byte dictionary offset)
+preimage create -a md5 -w wordlist.txt -o md5.idx2 --compact-index
 
 # 2. Sort it in place — DO NOT INTERRUPT, a partial sort corrupts the file
 preimage sort md5.idx                 # 2 GiB buffer by default
@@ -154,6 +158,9 @@ preimage list
 ```text
 
 Sorting is deterministic: the same wordlist always produces a byte-identical index.
+Legacy v1 remains the default for compatibility. `--compact-index` writes IDX2, which
+supports the same sort/check/search workflow while reducing each entry from 14 to 13
+bytes. IDX2 dictionary byte offsets are limited to 40 bits (1 TiB address space).
 
 Sorting an index larger than the memory budget needs free disk space for a scratch
 file about the size of the index, alongside it, which is renamed over the original

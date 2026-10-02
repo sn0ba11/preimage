@@ -236,6 +236,9 @@ struct CreateArgs {
     /// Output index path (single wordlist, or --dir --mode combined)
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Write compact IDX2 (13-byte entries with a versioned header) instead of legacy v1.
+    #[arg(long)]
+    compact_index: bool,
     /// Where to write the concatenated dictionary (--dir --mode combined)
     #[arg(long)]
     dict: Option<PathBuf>,
@@ -344,7 +347,7 @@ fn cmd_create(args: CreateArgs) -> Result<()> {
                 .output
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("--output <index> is required with --wordlist"))?;
-            create_one(algorithm, wordlist, output)
+            create_one(algorithm, wordlist, output, args.compact_index)
         }
         (None, Some(dir)) => {
             let files = list_wordlist_files(dir)?;
@@ -364,7 +367,14 @@ fn cmd_create(args: CreateArgs) -> Result<()> {
                     let dict = args.dict.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("--dict <dictionary> is required for --mode combined")
                     })?;
-                    create_combined(&args.algorithm, algorithm, &files, dict, output)
+                    create_combined(
+                        &args.algorithm,
+                        algorithm,
+                        &files,
+                        dict,
+                        output,
+                        args.compact_index,
+                    )
                 }
                 DirMode::Separate => {
                     let out_dir = args.out_dir.as_ref().ok_or_else(|| {
@@ -373,7 +383,14 @@ fn cmd_create(args: CreateArgs) -> Result<()> {
                     let config = args.config.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("--config <tables.toml> is required for --mode separate")
                     })?;
-                    create_separate(&args.algorithm, algorithm, &files, out_dir, config)
+                    create_separate(
+                        &args.algorithm,
+                        algorithm,
+                        &files,
+                        out_dir,
+                        config,
+                        args.compact_index,
+                    )
                 }
             }
         }
@@ -393,9 +410,18 @@ fn create_progress_bar() -> ProgressBar {
 }
 
 /// Index a single wordlist file — the original `create` behaviour.
-fn create_one(algorithm: &dyn HashAlgorithm, wordlist: &Path, output: &Path) -> Result<()> {
+fn create_one(
+    algorithm: &dyn HashAlgorithm,
+    wordlist: &Path,
+    output: &Path,
+    compact_index: bool,
+) -> Result<()> {
     let pb = create_progress_bar();
-    let index = IndexFile::build(algorithm, wordlist, output, Some(&pb))?;
+    let index = if compact_index {
+        IndexFile::build_compact(algorithm, wordlist, output, Some(&pb))?
+    } else {
+        IndexFile::build(algorithm, wordlist, output, Some(&pb))?
+    };
     pb.finish_and_clear();
     let count = index.entry_count()?;
     println!("Index creation complete. {count} entries written.");
@@ -409,6 +435,7 @@ fn create_combined(
     files: &[PathBuf],
     dict_path: &Path,
     index_path: &Path,
+    compact_index: bool,
 ) -> Result<()> {
     for f in files {
         if same_existing_path(f, dict_path) || same_existing_path(f, index_path) {
@@ -424,7 +451,11 @@ fn create_combined(
     concatenate_files(files, dict_path)?;
 
     let pb = create_progress_bar();
-    let index = IndexFile::build(algorithm, dict_path, index_path, Some(&pb))?;
+    let index = if compact_index {
+        IndexFile::build_compact(algorithm, dict_path, index_path, Some(&pb))?
+    } else {
+        IndexFile::build(algorithm, dict_path, index_path, Some(&pb))?
+    };
     pb.finish_and_clear();
     let count = index.entry_count()?;
 
@@ -450,6 +481,7 @@ fn create_separate(
     files: &[PathBuf],
     out_dir: &Path,
     config_path: &Path,
+    compact_index: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(out_dir)?;
 
@@ -479,7 +511,11 @@ fn create_separate(
             table.index.display()
         );
         let pb = create_progress_bar();
-        IndexFile::build(algorithm, &table.dictionary, &table.index, Some(&pb))?;
+        if compact_index {
+            IndexFile::build_compact(algorithm, &table.dictionary, &table.index, Some(&pb))?;
+        } else {
+            IndexFile::build(algorithm, &table.dictionary, &table.index, Some(&pb))?;
+        }
         pb.finish_and_clear();
     }
 
@@ -1305,6 +1341,7 @@ mod tests {
             &[foo, foo_idx.clone()],
             dir.path(),
             &config,
+            false,
         )
         .expect_err("an index output must not overwrite another input file");
 
@@ -1336,6 +1373,7 @@ mod tests {
             &[words],
             &out_dir,
             &config,
+            false,
         )
         .expect_err("config must not share a generated index path");
 

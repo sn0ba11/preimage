@@ -241,23 +241,36 @@ LZX is a SpectreDemo deployment optimisation only, not the canonical Preimage fo
 ## Priority 3 — NTLM index v2
 
 ### PRE-029: Easy IDX v2 — 5-byte dictionary offsets
-Status: TODO
+Status: DONE
 Difficulty: Easy–Moderate
 
 The 136,291,884,307-byte dictionary's largest byte offset fits in 37 bits. A 5-byte/40-bit offset is therefore sufficient and reduces IDX entries from 14 to 13 bytes without changing sort order or lookup semantics.
 
-Expected payload saving at 11,883,323,259 IDX entries:
-- **11,883,323,259 bytes (~11.88 GB decimal)**
+Implemented layout:
+- 24-byte explicit `PREIMAGE-IDX2` header
+- 8-byte hash prefix + 5-byte dictionary byte offset = 13-byte entries
+- CLI opt-in: `preimage create ... --compact-index`
+- legacy headerless 14-byte v1 remains the default and fully readable
+
+At 11,883,323,259 production IDX entries, projected IDX2 size is **154,483,202,391 bytes**, saving **11,883,323,235 bytes (~11.88 GB decimal)** after the 24-byte header.
 
 Requirements:
 - explicit IDX v2 versioning
 - retain v1 14-byte reader support
 - audit `ENTRY_SIZE`, `POSITION_LEN`, packed-layout assertions and unsafe bulk read/write code
 
+Completed evidence:
+- build/sort/check/mmap lookup round-trip passes against the known NTLM `apple` fixture
+- targeted external-merge test proves the IDX2 header survives scratch-file ping-pong
+- full workspace suite passes **392 tests, zero failures**
+
 Acceptance:
 - identical lookup answers to v1
 - no material lookup regression
 - size reduction matches the 1-byte-per-entry calculation
+
+Remaining production gate:
+- benchmark lookup/sort throughput on production-scale IDX2 before making it the default
 
 ### PRE-030: Remove per-entry dictionary byte offsets
 Status: TODO

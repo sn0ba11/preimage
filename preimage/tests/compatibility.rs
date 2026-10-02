@@ -73,6 +73,37 @@ fn assert_contains_word(plaintexts: &[&[u8]], word: &[u8], context: &str) {
     );
 }
 
+#[test]
+fn compact_idx2_build_sort_check_and_lookup_round_trip() {
+    let words = test_words_path();
+    let temp = NamedTempFile::new().expect("temp file");
+
+    let index = IndexFile::build_compact(NTLM, &words, temp.path(), None)
+        .expect("compact build failed");
+    assert_eq!(index.entry_count().expect("entry count"), WORDS_IN_FIXTURE);
+
+    let expected_size = 24 + WORDS_IN_FIXTURE * 13;
+    assert_eq!(
+        std::fs::metadata(temp.path()).unwrap().len(),
+        expected_size,
+        "IDX2 must be a 24-byte header plus 13 bytes per entry"
+    );
+
+    index.sort(1024 * 1024, None).expect("compact sort failed");
+    assert!(index.check_sorted(None).expect("compact check failed"));
+
+    let table = index
+        .into_lookup_table(NTLM, &words)
+        .expect("open compact lookup table");
+    let found = table
+        .lookup("5ebe7dfa074da8ee8aef1faa2bbde876")
+        .expect("compact lookup failed");
+    assert!(
+        found.iter().any(|m| m.is_full() && m.plaintext() == b"apple"),
+        "compact IDX2 must crack the same plaintext as v1"
+    );
+}
+
 // ============================================================
 // Cross-implementation: Rust cracks hashes against PHP+C indexes
 // ============================================================

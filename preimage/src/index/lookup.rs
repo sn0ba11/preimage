@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use memmap2::Mmap;
 
-use super::entry::{decode_position, ENTRY_SIZE, HASH_PREFIX_LEN, POSITION_LEN};
+use super::entry::{HASH_PREFIX_LEN, POSITION_LEN};
+use super::format::IndexFormat;
 use crate::HashAlgorithm;
 
 /// A match from looking up one hash against one index.
@@ -86,6 +87,7 @@ pub struct LookupTable {
     index_mmap: Mmap,
     dict_path: PathBuf,
     entry_count: u64,
+    format: IndexFormat,
 }
 
 /// The result of a collision-block walk: what was kept, and what was there.
@@ -153,18 +155,10 @@ impl LookupTable {
         index_path: &Path,
         dict_path: &Path,
     ) -> Result<Self> {
-        let index_file = File::open(index_path)?;
+        let mut index_file = File::open(index_path)?;
         let file_size = index_file.metadata()?.len();
-
-        if file_size % ENTRY_SIZE as u64 != 0 {
-            bail!(
-                "index file size {} is not a multiple of entry size {}",
-                file_size,
-                ENTRY_SIZE
-            );
-        }
-
-        let entry_count = file_size / ENTRY_SIZE as u64;
+        let format = IndexFormat::detect_reader(&mut index_file, file_size)?;
+        let entry_count = format.entry_count_for_size(file_size)?;
 
         // Prove the dictionary is there and readable now, rather than discovering it on
         // the first lookup. Nothing else in `open` touches it -- the path is stored and
@@ -219,6 +213,7 @@ impl LookupTable {
             index_mmap,
             dict_path: dict_path.to_path_buf(),
             entry_count,
+            format,
         })
     }
 
@@ -343,19 +338,26 @@ impl LookupTable {
 
     /// Read the 8-byte hash prefix of an entry directly from the mmap.
     fn get_entry_prefix(&self, index: u64) -> [u8; HASH_PREFIX_LEN] {
-        let offset = index as usize * ENTRY_SIZE;
+        let offset = self.format.data_offset() as usize
+            + index as usize * self.format.entry_size();
         let mut prefix = [0u8; HASH_PREFIX_LEN];
         prefix.copy_from_slice(&self.index_mmap[offset..offset + HASH_PREFIX_LEN]);
         prefix
     }
 
-    /// Read the 48-bit LE position of an entry directly from the mmap.
+    /// Read the little-endian dictionary position of an entry directly from the mmap.
     fn get_entry_position(&self, index: u64) -> u64 {
-        let offset = index as usize * ENTRY_SIZE + HASH_PREFIX_LEN;
-        let bytes: &[u8; POSITION_LEN] = self.index_mmap[offset..offset + POSITION_LEN]
-            .try_into()
-            .expect("slice is exactly POSITION_LEN bytes");
-        decode_position(bytes)
+        let offset = self.format.data_offset() as usize
+            + index as usize * self.format.entry_size()
+            + HASH_PREFIX_LEN;
+        let mut bytes = [0u8; POSITION_LEN];
+        let stored_len = self.format.position_len();
+        bytes[..stored_len].copy_from_slice(&self.index_mmap[offset..offset + stored_len]);
+        let mut value = 0u64;
+        for i in (0..POSITION_LEN).rev() {
+            value = (value << 8) | bytes[i] as u64;
+        }
+        value
     }
 }
 

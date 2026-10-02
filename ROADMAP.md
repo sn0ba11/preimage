@@ -145,7 +145,7 @@ A full PIM miss scan should never touch the compressed dictionary body.
 
 The sparse ordinal sidecar and compressed-dictionary block table solve overlapping ordinal→location problems; design them as one compatible indexing scheme where possible rather than maintaining two independent mappings.
 
-## Design idea 5 — Easy NTLM v2 win: 5-byte offsets
+## Design idea 5 — Easy NTLM v2 win: 5-byte offsets — IMPLEMENTED
 
 Before the harder succinct-index work, there is a low-risk reduction available. The dictionary is 136,291,884,307 bytes, so its largest byte offset fits in 37 bits. A 40-bit/5-byte offset is sufficient.
 
@@ -161,7 +161,7 @@ Easy IDX v2:
 8-byte prefix + 5-byte offset = 13 bytes
 ```
 
-At 11,883,323,259 IDX records this saves **11,883,323,259 bytes (~11.88 GB decimal)** without changing sort order or lookup semantics. This is compatible with later succinct-prefix work.
+Implemented as IDX2 with a 24-byte explicit versioned header and 13-byte entries. At 11,883,323,259 production records the projected file is **154,483,202,391 bytes**, saving **11,883,323,235 bytes (~11.88 GB decimal)** versus v1. Legacy v1 remains the default/readable format. This is compatible with later succinct-prefix work.
 
 ## Design idea 6 — NTLM requires a separate approach
 

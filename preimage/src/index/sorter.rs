@@ -4,10 +4,11 @@ use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use indicatif::ProgressBar;
 
 use super::entry::{IndexEntry, ENTRY_SIZE};
+use super::format::IndexFormat;
 
 impl super::IndexFile {
     /// Sort the index file in-place with the given memory budget (in bytes).
@@ -90,7 +91,7 @@ impl IndexSorter {
         index_path: &Path,
         progress: Option<&ProgressBar>,
     ) -> Result<()> {
-        let (file, num_entries) = self.open_and_validate(index_path)?;
+        let (file, num_entries, format) = self.open_and_validate(index_path)?;
         if num_entries <= 1 {
             return Ok(());
         }
@@ -105,7 +106,7 @@ impl IndexSorter {
             let mut file = file;
             let count = num_entries as usize;
             self.buffer = vec![IndexEntry::new([0; 8], 0); count];
-            self.sort_range_in_memory(&mut file, 0, count, progress)?;
+            self.sort_range_in_memory(&mut file, 0, count, format, progress)?;
             return Ok(());
         }
 
@@ -115,7 +116,15 @@ impl IndexSorter {
         let run_entries = buf_count.max(MIN_RUN_ENTRIES);
         let tmp_path = sort_tmp_path(index_path);
 
-        let result = self.external_sort(file, index_path, &tmp_path, num_entries, run_entries, progress);
+        let result = self.external_sort(
+            file,
+            index_path,
+            &tmp_path,
+            num_entries,
+            run_entries,
+            format,
+            progress,
+        );
 
         // A failed sort must not leave the scratch file behind. On success the
         // temp file has either been renamed onto the index or already removed.
@@ -132,7 +141,7 @@ impl IndexSorter {
         index_path: &Path,
         progress: Option<&ProgressBar>,
     ) -> Result<()> {
-        let (mut file, num_entries) = self.open_and_validate(index_path)?;
+        let (mut file, num_entries, format) = self.open_and_validate(index_path)?;
         if num_entries <= 1 {
             return Ok(());
         }
@@ -178,24 +187,17 @@ impl IndexSorter {
 
         self.entries_sorted = 0;
         self.total_entries = num_entries;
-        self.sort_range_in_memory(&mut file, 0, count, progress)?;
+        self.sort_range_in_memory(&mut file, 0, count, format, progress)?;
 
         Ok(())
     }
 
-    fn open_and_validate(&self, index_path: &Path) -> Result<(File, u64)> {
-        let file = File::options().read(true).write(true).open(index_path)?;
+    fn open_and_validate(&self, index_path: &Path) -> Result<(File, u64, IndexFormat)> {
+        let mut file = File::options().read(true).write(true).open(index_path)?;
         let file_size = file.metadata()?.len();
-
-        if file_size % ENTRY_SIZE as u64 != 0 {
-            bail!(
-                "index file size {} is not a multiple of entry size {}",
-                file_size,
-                ENTRY_SIZE
-            );
-        }
-
-        Ok((file, file_size / ENTRY_SIZE as u64))
+        let format = IndexFormat::detect_reader(&mut file, file_size)?;
+        let entries = format.entry_count_for_size(file_size)?;
+        Ok((file, entries, format))
     }
 
     fn update_progress(&self, pb: &ProgressBar, action: &str) {
@@ -215,18 +217,19 @@ impl IndexSorter {
         file: &mut File,
         start: u64,
         count: usize,
+        format: IndexFormat,
         progress: Option<&ProgressBar>,
     ) -> Result<()> {
         debug_assert!(count <= self.buffer.len());
         let count_fmt = format_count(count as u64);
-        let byte_start = start * ENTRY_SIZE as u64;
+        let byte_start = format.data_offset() + start * format.entry_size() as u64;
 
         if let Some(pb) = progress {
             self.update_progress(pb, &format!("loading {count_fmt} entries into memory"));
         }
 
         file.seek(SeekFrom::Start(byte_start))?;
-        IndexEntry::read_bulk(file, &mut self.buffer, count)?;
+        IndexEntry::read_bulk_format(file, &mut self.buffer, count, format)?;
 
         if let Some(pb) = progress {
             self.update_progress(pb, &format!("sorting {count_fmt} entries in memory"));
@@ -241,7 +244,7 @@ impl IndexSorter {
         }
 
         file.seek(SeekFrom::Start(byte_start))?;
-        IndexEntry::write_bulk(file, &self.buffer, count)?;
+        IndexEntry::write_bulk_format(file, &self.buffer, count, format)?;
 
         self.entries_sorted += count as u64;
         Ok(())
@@ -259,10 +262,11 @@ impl IndexSorter {
         tmp_path: &Path,
         num_entries: u64,
         run_entries: usize,
+        format: IndexFormat,
         progress: Option<&ProgressBar>,
     ) -> Result<()> {
         // Phase 1: turn the file into a sequence of sorted runs, in place.
-        let runs = self.generate_runs(file, num_entries, run_entries, progress)?;
+        let runs = self.generate_runs(file, num_entries, run_entries, format, progress)?;
 
         // When the budget is below MIN_RUN_ENTRIES but the file is smaller still,
         // run generation sorts the whole thing as one run, in place — nothing to
@@ -283,7 +287,7 @@ impl IndexSorter {
         let mut dst = tmp_path.to_path_buf();
 
         while runs.len() > 1 {
-            runs = self.merge_pass(&src, &dst, &runs, fan_in, stream_bytes, progress)?;
+            runs = self.merge_pass(&src, &dst, &runs, fan_in, stream_bytes, format, progress)?;
             std::mem::swap(&mut src, &mut dst);
         }
 
@@ -306,6 +310,7 @@ impl IndexSorter {
         mut file: File,
         num_entries: u64,
         run_entries: usize,
+        format: IndexFormat,
         progress: Option<&ProgressBar>,
     ) -> Result<Vec<(u64, u64)>> {
         self.buffer = vec![IndexEntry::new([0; 8], 0); run_entries];
@@ -314,7 +319,7 @@ impl IndexSorter {
         let mut start = 0u64;
         while start < num_entries {
             let count = run_entries.min((num_entries - start) as usize);
-            self.sort_range_in_memory(&mut file, start, count, progress)?;
+            self.sort_range_in_memory(&mut file, start, count, format, progress)?;
             runs.push((start, count as u64));
             start += count as u64;
         }
@@ -350,15 +355,17 @@ impl IndexSorter {
         runs: &[(u64, u64)],
         fan_in: usize,
         stream_bytes: usize,
+        format: IndexFormat,
         progress: Option<&ProgressBar>,
     ) -> Result<Vec<(u64, u64)>> {
         let mut writer = File::create(dst)?;
+        format.write_header(&mut writer)?;
         let mut out_runs = Vec::with_capacity(runs.len().div_ceil(fan_in));
         let mut out_start = 0u64;
 
         for group in runs.chunks(fan_in) {
             let merged_len: u64 = group.iter().map(|(_, len)| *len).sum();
-            self.merge_group(src, &mut writer, group, stream_bytes, progress)?;
+            self.merge_group(src, &mut writer, group, stream_bytes, format, progress)?;
             out_runs.push((out_start, merged_len));
             out_start += merged_len;
         }
@@ -375,13 +382,14 @@ impl IndexSorter {
         writer: &mut File,
         group: &[(u64, u64)],
         stream_bytes: usize,
+        format: IndexFormat,
         progress: Option<&ProgressBar>,
     ) -> Result<()> {
         let mut readers: Vec<RunReader> = Vec::with_capacity(group.len());
         let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(group.len());
 
         for &(start, len) in group {
-            let mut reader = RunReader::open(src, start, len, stream_bytes)?;
+            let mut reader = RunReader::open(src, start, len, stream_bytes, format)?;
             if let Some(entry) = reader.next_entry()? {
                 heap.push(HeapItem {
                     key: entry,
@@ -397,7 +405,7 @@ impl IndexSorter {
         while let Some(HeapItem { key, run }) = heap.pop() {
             out_buf.push(key);
             if out_buf.len() == out_batch {
-                IndexEntry::write_bulk(writer, &out_buf, out_buf.len())?;
+                IndexEntry::write_bulk_format(writer, &out_buf, out_buf.len(), format)?;
                 out_buf.clear();
             }
 
@@ -414,7 +422,7 @@ impl IndexSorter {
         }
 
         if !out_buf.is_empty() {
-            IndexEntry::write_bulk(writer, &out_buf, out_buf.len())?;
+            IndexEntry::write_bulk_format(writer, &out_buf, out_buf.len(), format)?;
         }
 
         Ok(())
@@ -434,15 +442,25 @@ fn sort_tmp_path(index_path: &Path) -> PathBuf {
 struct RunReader {
     reader: BufReader<File>,
     remaining: u64,
+    format: IndexFormat,
 }
 
 impl RunReader {
-    fn open(path: &Path, start: u64, len: u64, buf_bytes: usize) -> Result<Self> {
+    fn open(
+        path: &Path,
+        start: u64,
+        len: u64,
+        buf_bytes: usize,
+        format: IndexFormat,
+    ) -> Result<Self> {
         let mut file = File::open(path)?;
-        file.seek(SeekFrom::Start(start * ENTRY_SIZE as u64))?;
+        file.seek(SeekFrom::Start(
+            format.data_offset() + start * format.entry_size() as u64,
+        ))?;
         Ok(Self {
-            reader: BufReader::with_capacity(buf_bytes.max(ENTRY_SIZE), file),
+            reader: BufReader::with_capacity(buf_bytes.max(format.entry_size()), file),
             remaining: len,
+            format,
         })
     }
 
@@ -450,7 +468,7 @@ impl RunReader {
         if self.remaining == 0 {
             return Ok(None);
         }
-        let entry = IndexEntry::read_from(&mut self.reader)?;
+        let entry = IndexEntry::read_from_format(&mut self.reader, self.format)?;
         self.remaining -= 1;
         Ok(Some(entry))
     }
@@ -568,6 +586,42 @@ mod tests {
         assert!(
             check_sorted(output.path(), None).expect("check failed"),
             "index sorted with tiny buffer should be sorted (entries: {count})"
+        );
+    }
+
+    #[test]
+    fn test_compact_v2_external_merge_preserves_header() {
+        let n = MIN_RUN_ENTRIES + 5000;
+        let mut wordlist = NamedTempFile::new().expect("temp file");
+        for i in 0..n {
+            writeln!(wordlist, "word{i}").expect("write");
+        }
+        wordlist.flush().expect("flush");
+        let output = NamedTempFile::new().expect("temp file");
+        IndexBuilder::build_with_format(
+            &Md5,
+            wordlist.path(),
+            output.path(),
+            IndexFormat::CompactV2,
+            None,
+        )
+        .expect("compact build");
+
+        let mut sorter = IndexSorter::new(512 * ENTRY_SIZE);
+        sorter
+            .sort_file(output.path(), None)
+            .expect("compact external sort failed");
+
+        assert!(check_sorted(output.path(), None).expect("compact check"));
+        let bytes = std::fs::read(output.path()).expect("read compact index");
+        assert_eq!(&bytes[..16], super::super::format::V2_MAGIC);
+        assert_eq!(
+            bytes.len() as u64,
+            super::super::format::V2_HEADER_SIZE + n as u64 * 13
+        );
+        assert!(
+            !sort_tmp_path(output.path()).exists(),
+            "compact scratch file must be cleaned up after sorting"
         );
     }
 

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) mod builder;
 pub(crate) mod checker;
+pub(crate) mod format;
 pub mod entry;
 pub mod lookup;
 pub(crate) mod sorter;
@@ -90,14 +91,12 @@ impl IndexFile {
 
     /// Count the number of entries in the index file.
     pub fn entry_count(&self) -> anyhow::Result<u64> {
-        let size = std::fs::metadata(&self.path)?.len();
-        if size % entry::ENTRY_SIZE as u64 != 0 {
-            anyhow::bail!(
-                "index file size {} is not a multiple of entry size {}",
-                size,
-                entry::ENTRY_SIZE
-            );
-        }
-        Ok(size / entry::ENTRY_SIZE as u64)
+        use std::io::Seek;
+
+        let mut file = std::fs::File::open(&self.path)?;
+        let size = file.metadata()?.len();
+        let format = format::IndexFormat::detect_reader(&mut file, size)?;
+        file.rewind()?;
+        format.entry_count_for_size(size)
     }
 }
