@@ -26,6 +26,8 @@ jobs:
             --volumes-from forgejo-runner \
             -e PREIMAGE_REQUIRE_CUDA=1 \
             -e CARGO_TARGET_DIR="$PWD/target-forgejo-cuda" \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
             -w "$PWD" \
             nvidia/cuda:12.4.1-devel-ubuntu22.04 \
             bash -lc '
@@ -45,16 +47,8 @@ jobs:
                 preimage README.md LICENSE-APACHE LICENSE-MIT
               sha256sum dist-cuda/preimage-linux-x86_64-cuda12.tar.gz \
                 > dist-cuda/preimage-linux-x86_64-cuda12.tar.gz.sha256
+              chown -R "$HOST_UID:$HOST_GID" target-forgejo-cuda dist-cuda
             '
-
-      - name: Upload workflow artifact
-        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
-        with:
-          name: preimage-linux-x86_64-cuda12
-          if-no-files-found: error
-          path: |
-            dist-cuda/preimage-linux-x86_64-cuda12.tar.gz
-            dist-cuda/preimage-linux-x86_64-cuda12.tar.gz.sha256
 
       - name: Publish Forgejo release
         if: startsWith(forgejo.ref, 'refs/tags/')
@@ -63,6 +57,7 @@ jobs:
           set -euo pipefail
           docker run --rm \
             --volumes-from forgejo-runner \
+            --network forgejo_default \
             -e FORGEJO_TOKEN \
             -e FORGEJO_API_URL \
             -e FORGEJO_REPOSITORY \
