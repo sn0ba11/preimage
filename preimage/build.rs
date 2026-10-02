@@ -15,7 +15,11 @@ fn main() {
         return;
     };
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
-    let library = out_dir.join("libpreimage_cloudap_cuda.a");
+    let library = out_dir.join(if cfg!(windows) {
+        "preimage_cloudap_cuda.lib"
+    } else {
+        "libpreimage_cloudap_cuda.a"
+    });
     let status = Command::new(&nvcc)
         .args(["--lib", "-O3", "--use_fast_math", "-lineinfo"])
         .arg(if cfg!(windows) {
@@ -36,12 +40,17 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=preimage_cloudap_cuda");
     println!("cargo:rustc-link-lib=dylib=cudart");
-    if cfg!(target_os = "linux") {
-        println!("cargo:rustc-link-lib=dylib=stdc++");
-        if let Some(root) = nvcc.parent().and_then(Path::parent) {
+    if let Some(root) = nvcc.parent().and_then(Path::parent) {
+        if cfg!(target_os = "linux") {
+            println!("cargo:rustc-link-lib=dylib=stdc++");
             let lib64 = root.join("lib64");
             if lib64.is_dir() {
                 println!("cargo:rustc-link-search=native={}", lib64.display());
+            }
+        } else if cfg!(windows) {
+            let lib_x64 = root.join("lib").join("x64");
+            if lib_x64.is_dir() {
+                println!("cargo:rustc-link-search=native={}", lib_x64.display());
             }
         }
     }

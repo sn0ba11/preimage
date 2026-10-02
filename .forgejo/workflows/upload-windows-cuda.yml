@@ -1,0 +1,43 @@
+name: Upload Windows CUDA release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .forgejo/workflows/upload-windows-cuda.yml
+
+jobs:
+  upload:
+    runs-on: docker
+    timeout-minutes: 10
+    steps:
+      - name: Check out staged release assets
+        uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          ref: release-assets
+          fetch-depth: 1
+
+      - name: Attach Windows CUDA assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f preimage-windows-x86_64-cuda12.zip
+          test -f preimage-windows-x86_64-cuda12.zip.sha256
+          docker run --rm \
+            --volumes-from forgejo-runner \
+            --network forgejo_default \
+            -e FORGEJO_TOKEN \
+            -w "$PWD" \
+            alpine:3.22 sh -lc '
+              set -euo pipefail
+              apk add --no-cache curl jq >/dev/null
+              auth="Authorization: token $FORGEJO_TOKEN"
+              release_url="http://forgejo:3000/api/v1/repos/sn0/preimage/releases"
+              release_json="$(curl -fsS -H "$auth" "$release_url/tags/v0.1.2-cloudap-cuda3")"
+              release_id="$(printf "%s" "$release_json" | jq -er ".id")"
+              for asset in preimage-windows-x86_64-cuda12.zip preimage-windows-x86_64-cuda12.zip.sha256; do
+                curl -fsS -H "$auth" -X POST -F "attachment=@$asset" \
+                  "$release_url/$release_id/assets?name=$(basename "$asset")" >/dev/null
+              done
+            '
