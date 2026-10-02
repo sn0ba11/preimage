@@ -250,15 +250,19 @@ extern "C" int preimage_cuda_device_count(int *count, char *error, size_t error_
 }
 
 extern "C" int preimage_cloudap_pbkdf2(const uint8_t *keys, uint64_t count,
-                                         uint32_t iterations, uint8_t *outputs,
-                                         char *error, size_t error_len) {
-    if (!keys || !outputs || !count || !iterations) {
+                                         uint32_t iterations, int device,
+                                         uint8_t *outputs, char *error,
+                                         size_t error_len) {
+    if (!keys || !outputs || !count || !iterations || device < 0) {
         if (error && error_len) snprintf(error,error_len,"invalid CUDA PBKDF2 arguments");
         return -1;
     }
+    cudaError_t code=cudaSetDevice(device);
+    if (code!=cudaSuccess) { set_error(error,error_len,"cudaSetDevice",code); return int(code); }
+
     uint8_t *device_keys=nullptr,*device_outputs=nullptr;
     size_t key_bytes=size_t(count)*64, output_bytes=size_t(count)*32;
-    cudaError_t code=cudaMalloc(reinterpret_cast<void **>(&device_keys),key_bytes);
+    code=cudaMalloc(reinterpret_cast<void **>(&device_keys),key_bytes);
     if (code!=cudaSuccess) { set_error(error,error_len,"cudaMalloc(keys)",code); return int(code); }
     code=cudaMalloc(reinterpret_cast<void **>(&device_outputs),output_bytes);
     if (code!=cudaSuccess) { set_error(error,error_len,"cudaMalloc(outputs)",code); cudaFree(device_keys); return int(code); }

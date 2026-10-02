@@ -692,7 +692,8 @@ fn process_cuda_ranges(
             ..ProcessedChunk::default()
         });
     }
-    let derived = cuda_pbkdf2(&key_blocks, offsets.len(), iterations)?;
+    let device_count = cuda_device_count()?;
+    let derived = cuda_pbkdf2_multi(&key_blocks, offsets.len(), iterations, device_count)?;
     let mut bytes = Vec::with_capacity(offsets.len() * RECORD_SIZE);
     for (index, offset) in offsets.into_iter().enumerate() {
         bytes.extend_from_slice(&derived[index * KEY_SIZE..(index + 1) * KEY_SIZE]);
@@ -772,7 +773,72 @@ fn cuda_device_count() -> Result<usize> {
 }
 
 #[cfg(preimage_cuda)]
-fn cuda_pbkdf2(key_blocks: &[u8], count: usize, iterations: u32) -> Result<Vec<u8>> {
+fn cuda_pbkdf2_multi(
+    key_blocks: &[u8],
+    count: usize,
+    iterations: u32,
+    device_count: usize,
+) -> Result<Vec<u8>> {
+    if key_blocks.len() != count * 64 {
+        bail!("internal CUDA key-block length mismatch");
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if device_count == 0 {
+        bail!("CUDA PBKDF2 requested with no CUDA devices available");
+    }
+
+    let workers = device_count.min(count);
+    let base = count / workers;
+    let remainder = count % workers;
+    let chunks = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        let mut start = 0usize;
+        for device in 0..workers {
+            let chunk_count = base + usize::from(device < remainder);
+            let end = start + chunk_count;
+            let keys = &key_blocks[start * 64..end * 64];
+            handles.push((
+                start,
+                end,
+                scope.spawn(move || cuda_pbkdf2_on_device(keys, chunk_count, iterations, device)),
+            ));
+            start = end;
+        }
+
+        handles
+            .into_iter()
+            .map(|(start, end, handle)| {
+                let output = handle
+                    .join()
+                    .expect("CloudAP CUDA device worker panicked")?;
+                Ok((start, end, output))
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+
+    let mut output = Vec::with_capacity(count * KEY_SIZE);
+    for (start, end, chunk) in chunks {
+        let expected = (end - start) * KEY_SIZE;
+        if chunk.len() != expected {
+            bail!(
+                "CUDA device returned {} bytes for records {start}..{end}; expected {expected}",
+                chunk.len()
+            );
+        }
+        output.extend_from_slice(&chunk);
+    }
+    Ok(output)
+}
+
+#[cfg(preimage_cuda)]
+fn cuda_pbkdf2_on_device(
+    key_blocks: &[u8],
+    count: usize,
+    iterations: u32,
+    device: usize,
+) -> Result<Vec<u8>> {
     use std::ffi::CStr;
     use std::os::raw::{c_char, c_int};
 
@@ -781,14 +847,13 @@ fn cuda_pbkdf2(key_blocks: &[u8], count: usize, iterations: u32) -> Result<Vec<u
             keys: *const u8,
             count: u64,
             iterations: u32,
+            device: c_int,
             outputs: *mut u8,
             error: *mut c_char,
             error_len: usize,
         ) -> c_int;
     }
-    if key_blocks.len() != count * 64 {
-        bail!("internal CUDA key-block length mismatch");
-    }
+    let device = c_int::try_from(device).context("CUDA device index does not fit c_int")?;
     let mut output = vec![0u8; count * KEY_SIZE];
     let mut error = [0i8; 512];
     let status = unsafe {
@@ -796,6 +861,7 @@ fn cuda_pbkdf2(key_blocks: &[u8], count: usize, iterations: u32) -> Result<Vec<u
             key_blocks.as_ptr(),
             count as u64,
             iterations,
+            device,
             output.as_mut_ptr(),
             error.as_mut_ptr(),
             error.len(),
@@ -803,13 +869,18 @@ fn cuda_pbkdf2(key_blocks: &[u8], count: usize, iterations: u32) -> Result<Vec<u
     };
     if status != 0 {
         let message = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
-        bail!("CUDA PBKDF2 failed: {message}");
+        bail!("CUDA PBKDF2 failed on device {device}: {message}");
     }
     Ok(output)
 }
 
 #[cfg(not(preimage_cuda))]
-fn cuda_pbkdf2(_key_blocks: &[u8], _count: usize, _iterations: u32) -> Result<Vec<u8>> {
+fn cuda_pbkdf2_multi(
+    _key_blocks: &[u8],
+    _count: usize,
+    _iterations: u32,
+    _device_count: usize,
+) -> Result<Vec<u8>> {
     bail!("CUDA support is not present in this binary")
 }
 

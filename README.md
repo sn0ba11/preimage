@@ -239,9 +239,10 @@ preimage cloudap build \
 both an existing completed cache and any resumable partial build.
 
 If `nvcc` is in `PATH` when Preimage is compiled, the build automatically includes
-the CUDA PBKDF2 kernel. `--backend auto` (the default) then uses an available NVIDIA
-GPU and falls back to the parallel CPU implementation when CUDA is not compiled in
-or no device is present. Use `--backend cpu` for a reproducible CPU-only run, or
+the CUDA PBKDF2 kernel. `--backend auto` (the default) then uses all visible NVIDIA GPUs
+and falls back to the parallel CPU implementation when CUDA is not compiled in
+or no device is present. Multi-GPU builds split each KDF batch into contiguous
+shards, one per visible CUDA device, and reassemble results in dictionary order. Use `--backend cpu` for a reproducible CPU-only run, or
 `--backend cuda` to require a GPU and fail instead of falling back:
 
 ```bash
@@ -252,7 +253,10 @@ preimage cloudap build \
   --output words.cloudap33700.pim
 ```
 
-The CPU and CUDA builders write the same version-1 cache records. CUDA accelerates
+The CPU and CUDA builders write the same version-1 cache records, so a partial
+single-GPU build can be resumed with a multi-GPU binary as long as the dictionary,
+iteration count, and output path are unchanged; do not use `--fresh` when resuming.
+CUDA accelerates
 the 10,000-round PBKDF2 build; it does not materially help the later cache scan,
 which streams already-derived keys and is normally limited by memory/storage I/O.
 
