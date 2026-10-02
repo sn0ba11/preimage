@@ -29,7 +29,7 @@ jobs:
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
             -w "$PWD" \
-            nvidia/cuda:12.4.1-devel-ubuntu22.04 \
+            nvidia/cuda:13.0.1-devel-ubuntu24.04 \
             bash -lc '
               set -euo pipefail
               apt-get update
@@ -40,13 +40,13 @@ jobs:
               export PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH
               nvcc --version
               cargo build --release -p preimage
-              ldd target-forgejo-cuda/release/preimage | grep "libcudart.so.12"
+              ldd target-forgejo-cuda/release/preimage | grep "libcudart.so.13"
               mkdir -p dist-cuda/package
               cp target-forgejo-cuda/release/preimage README.md LICENSE-APACHE LICENSE-MIT dist-cuda/package/
-              tar -C dist-cuda/package -czf dist-cuda/preimage-linux-x86_64-cuda12.tar.gz \
+              tar -C dist-cuda/package -czf dist-cuda/preimage-linux-x86_64-cuda13.tar.gz \
                 preimage README.md LICENSE-APACHE LICENSE-MIT
-              sha256sum dist-cuda/preimage-linux-x86_64-cuda12.tar.gz \
-                > dist-cuda/preimage-linux-x86_64-cuda12.tar.gz.sha256
+              sha256sum dist-cuda/preimage-linux-x86_64-cuda13.tar.gz \
+                > dist-cuda/preimage-linux-x86_64-cuda13.tar.gz.sha256
               chown -R "$HOST_UID:$HOST_GID" target-forgejo-cuda dist-cuda
             '
 
@@ -74,11 +74,11 @@ jobs:
                 payload="$(jq -nc \
                   --arg tag "$FORGEJO_REF_NAME" \
                   --arg sha "$FORGEJO_SHA" \
-                  "{tag_name:\$tag,target_commitish:\$sha,name:(\"Preimage \" + \$tag),body:\"CUDA 12.4 Linux x86-64 build with CloudAP / Microsoft Online mode 33700 acceleration. The build fails closed if nvcc is unavailable.\",draft:false,prerelease:false}")"
+                  "{tag_name:\$tag,target_commitish:\$sha,name:(\"Preimage \" + \$tag),body:\"CUDA 13 Linux x86-64 build with CloudAP / Microsoft Online mode 33700 acceleration. The build fails closed if nvcc is unavailable.\",draft:false,prerelease:false}")"
                 release_json="$(printf "%s" "$payload" | curl -fsS -H "$auth" -H "Content-Type: application/json" -X POST --data-binary @- "$release_url")"
               fi
               release_id="$(printf "%s" "$release_json" | jq -er ".id")"
-              for asset in dist-cuda/preimage-linux-x86_64-cuda12.tar.gz dist-cuda/preimage-linux-x86_64-cuda12.tar.gz.sha256; do
+              for asset in dist-cuda/preimage-linux-x86_64-cuda13.tar.gz dist-cuda/preimage-linux-x86_64-cuda13.tar.gz.sha256; do
                 name="$(basename "$asset")"
                 curl -fsS -H "$auth" -X POST -F "attachment=@$asset" \
                   "$release_url/$release_id/assets?name=$name" >/dev/null

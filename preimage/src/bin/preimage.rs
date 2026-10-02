@@ -8,8 +8,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use preimage::{
-    get_algorithm, CloudapBuildBackend, CloudapCache, CloudapTarget, HashAlgorithm, HashResult,
-    IndexFile, PreimageOracle, ALGORITHM_NAMES, DEFAULT_CLOUDAP_ITERATIONS,
+    cloudap_cuda_device_count, get_algorithm, CloudapBuildBackend, CloudapCache, CloudapTarget,
+    HashAlgorithm, HashResult, IndexFile, PreimageOracle, ALGORITHM_NAMES,
+    DEFAULT_CLOUDAP_ITERATIONS,
 };
 
 #[path = "shared/memory_size.rs"]
@@ -663,11 +664,12 @@ fn cloudap_build_progress_bar() -> ProgressBar {
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
             )
             .expect("valid template")
             .progress_chars("#>-"),
     );
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb
 }
 
@@ -804,7 +806,21 @@ fn build_one_cloudap_cache(
     backend: CloudapBuildBackend,
     fresh: bool,
 ) -> Result<()> {
+    let cuda_devices = cloudap_cuda_device_count().unwrap_or(0);
+    let resolved = match backend {
+        CloudapBuildBackend::Cuda => "cuda",
+        CloudapBuildBackend::Cpu => "cpu",
+        CloudapBuildBackend::Auto if cuda_devices > 0 => "cuda",
+        CloudapBuildBackend::Auto => "cpu",
+    };
+    println!(
+        "CloudAP build starting: backend={resolved} (requested={backend}, CUDA devices={cuda_devices})"
+    );
+    println!("  input:  {}", dictionary.display());
+    println!("  output: {}", cache.display());
+
     let pb = cloudap_build_progress_bar();
+    pb.set_message(format!("backend={resolved}"));
     let stats = CloudapCache::build_with_backend(
         dictionary,
         cache,
