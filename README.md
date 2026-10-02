@@ -146,8 +146,8 @@ preimage sort --ram md5.idx           # all in RAM, errors if it doesn't fit
 # 3. Confirm it is sorted
 preimage check md5.idx
 
-# 4. Look hashes up
-preimage lookup -a md5 -i md5.idx -d wordlist.txt 5f4dcc3b5aa765d61d8327deb882cf99
+# 4. Search the precomputed index
+preimage search -a md5 -c md5.idx -d wordlist.txt 5f4dcc3b5aa765d61d8327deb882cf99
 
 # 5. See the supported algorithms
 preimage list
@@ -162,6 +162,30 @@ scratch file. As the warning says, do not interrupt a sort: the run-generation p
 rewrites the file in place, so an interrupted or failed sort (out of disk, for
 instance) can leave it partially sorted and in need of a rebuild.
 
+### Default search config
+
+For a frequently used cache/index, put the algorithm, cache and dictionary in the
+user config once and then search with only the target:
+
+```toml
+algorithm = "ntlm"
+cache = "/data/ntlm.idx"
+dictionary = "/data/words.txt"
+```
+
+```bash
+preimage search <hash>
+```
+
+For a CloudAP cache use `algorithm = "cloudap"`; the target itself is still
+auto-detected from `$MSONLINEACCOUNT$0$...`. Relative cache/dictionary paths are
+resolved relative to the config file. CLI `-a`, `-c` and `-d` values override
+matching defaults.
+
+The default config location is `$XDG_CONFIG_HOME/preimage/config.toml` or
+`~/.config/preimage/config.toml` on Linux and `%APPDATA%\\preimage\\config.toml`
+on Windows. Set `PREIMAGE_CONFIG` to use a different path.
+
 ### Indexing a folder
 
 `create --dir <folder>` indexes every file in a folder (sorted by name, for a
@@ -173,13 +197,13 @@ search over one index — searching *N* separate indexes costs *N* of them:
 # it. One binary search per lookup; rebuild the whole thing to add a file.
 preimage create -a md5 --dir words/ --mode combined -o all.idx --dict all.txt
 preimage sort all.idx
-preimage lookup -a md5 -i all.idx -d all.txt <hash>
+preimage search -a md5 -c all.idx -d all.txt <hash>
 
 # Separate: one index per file, plus a generated config. Lookups search every
 # table; add a file later without rebuilding the others.
 preimage create -a md5 --dir words/ --mode separate --out-dir idx/ --config tables.toml
 # sort each idx/*.idx, then:
-preimage lookup --config tables.toml <hash>
+preimage search --config tables.toml <hash>
 ```
 
 Prefer `combined` unless the set of wordlists changes often: one index is the
@@ -188,7 +212,7 @@ concatenated dictionary (with a newline inserted between files so words never
 merge) that becomes the dictionary the positions point into, so keep it.
 
 To search several tables at once, describe them in a config file and use
-`preimage lookup --config tables.toml <hash>...` — this is also what
+`preimage search --config tables.toml <hash>...` — this is also what
 `--mode separate` writes for you:
 
 ```toml
@@ -239,16 +263,15 @@ preimage cloudap build \
 both an existing completed cache and any resumable partial build.
 
 If `nvcc` is in `PATH` when Preimage is compiled, the build automatically includes
-the CUDA PBKDF2 kernel. `--backend auto` (the default) then uses all visible NVIDIA GPUs
-and falls back to the parallel CPU implementation when CUDA is not compiled in
-or no device is present. Multi-GPU builds split each KDF batch into contiguous
-shards, one per visible CUDA device, and reassemble results in dictionary order. Use `--backend cpu` for a reproducible CPU-only run, or
-`--backend cuda` to require a GPU and fail instead of falling back:
+the CUDA PBKDF2 kernel. At runtime Preimage automatically uses all visible NVIDIA GPUs
+and falls back to the parallel CPU implementation when CUDA is not compiled in or no
+CUDA device is present. There is no backend flag to select. Multi-GPU builds split
+each KDF batch into contiguous shards, one per visible CUDA device, and reassemble
+results in dictionary order:
 
 ```bash
 cargo build --release
 preimage cloudap build \
-  --backend cuda \
   --wordlist words.txt \
   --output words.cloudap33700.pim
 ```
@@ -290,21 +313,22 @@ example, one billion candidates require about 38 GB (35.4 GiB) of cache data.
 Lines that are not valid UTF-8 are skipped and counted because the CloudAP KDF is
 defined here over the Unicode password encoded as UTF-16LE.
 
-### Scan a Spectre 33700 target
+### Search a Spectre 33700 target
+
+The same `preimage search` command is used for ordinary indexes and CloudAP caches.
+CloudAP targets are detected automatically from the `$MSONLINEACCOUNT$0$...` prefix.
 
 Single cache:
 
 ```bash
-preimage cloudap scan \
-  --cache words.cloudap33700.pim \
-  --dictionary words.txt \
+preimage search -c words.cloudap33700.pim -d words.txt \
   '$MSONLINEACCOUNT$0$10000$...'
 ```
 
 Folder config, using Spectre's exported `.hash` file directly:
 
 ```bash
-preimage cloudap scan \
+preimage search \
   --config /media/raid/wordlists/pre/cloudap33700.toml \
   --target-file cloudap-33700.hash
 ```
@@ -319,7 +343,7 @@ sequential access pattern. Validate a cache/dictionary pair without
 scanning a target with:
 
 ```bash
-preimage cloudap check --cache words.cloudap33700.pim --dictionary words.txt
+preimage cloudap check -c words.cloudap33700.pim -d words.txt
 ```
 
 On the same 20-thread Core i5-14600T used for the index benchmarks, a release build

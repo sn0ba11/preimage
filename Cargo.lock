@@ -551,6 +551,7 @@ dependencies = [
  "allthehashes",
  "anyhow",
  "clap",
+ "console",
  "hex",
  "humansize",
  "indicatif",

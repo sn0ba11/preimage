@@ -1,3 +1,4 @@
+use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -5,6 +6,7 @@ use std::process;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use preimage::{
@@ -35,9 +37,9 @@ WORKFLOW:
   3. Verify the index is sorted:
        preimage check md5.idx
 
-  4. Look up hashes:
-       preimage lookup -a md5 -i md5.idx -d wordlist.txt <hash>...
-       preimage lookup --config tables.toml <hash>...
+  4. Search hashes:
+       preimage search -a md5 -c md5.idx -d wordlist.txt <hash>...
+       preimage search --config tables.toml <hash>...
 
   5. List supported algorithms:
        preimage list
@@ -111,8 +113,9 @@ EXAMPLE:
         /// Path to the index file
         index: PathBuf,
     },
-    /// Look up hashes against index(es)
-    Lookup(LookupArgs),
+    /// Search a precomputed cache/index for a password
+    #[command(alias = "lookup")]
+    Search(SearchArgs),
     /// Build or query reusable CloudAP / Hashcat mode 33700 KDF caches
     Cloudap {
         #[command(subcommand)]
@@ -127,6 +130,7 @@ enum CloudapCommands {
     /// Precompute unsalted CloudAP PBKDF2 keys for one wordlist or a folder
     Build(CloudapBuildArgs),
     /// Scan one cache, or a generated cache config, against a 33700 target
+    #[command(hide = true)]
     Scan(CloudapScanArgs),
     /// Verify a completed cache and its dictionary binding
     Check(CloudapCheckArgs),
@@ -146,7 +150,7 @@ struct CloudapBuildArgs {
     /// Output directory for --dir caches
     #[arg(long)]
     out_dir: Option<PathBuf>,
-    /// TOML config written for --dir and accepted by `cloudap scan --config`
+    /// TOML config written for --dir and accepted by `preimage search --config`
     #[arg(long)]
     config: Option<PathBuf>,
     /// PBKDF2 iteration count; current CloudAP/33700 uses 10000
@@ -155,9 +159,6 @@ struct CloudapBuildArgs {
     /// Worker threads; 0 uses all available logical CPUs
     #[arg(long, default_value_t = 0)]
     threads: usize,
-    /// KDF backend: auto uses CUDA when this binary and host support it
-    #[arg(long, default_value_t = CloudapBuildBackend::Auto)]
-    backend: CloudapBuildBackend,
     /// Discard completed/partial output and rebuild from the beginning
     #[arg(long)]
     fresh: bool,
@@ -166,13 +167,13 @@ struct CloudapBuildArgs {
 #[derive(clap::Args)]
 struct CloudapScanArgs {
     /// One completed CloudAP cache
-    #[arg(short = 'i', long)]
+    #[arg(short = 'c', long)]
     cache: Option<PathBuf>,
     /// Dictionary paired with --cache
     #[arg(short, long)]
     dictionary: Option<PathBuf>,
     /// Config produced by `cloudap build --dir`
-    #[arg(short = 'c', long)]
+    #[arg(long)]
     config: Option<PathBuf>,
     /// Read one `$MSONLINEACCOUNT$0$...` target from a Spectre/Hashcat .hash file
     #[arg(long)]
@@ -190,7 +191,7 @@ struct CloudapScanArgs {
 #[derive(clap::Args)]
 struct CloudapCheckArgs {
     /// Completed CloudAP cache
-    #[arg(short = 'i', long)]
+    #[arg(short = 'c', long)]
     cache: PathBuf,
     /// Dictionary paired with the cache
     #[arg(short, long)]
@@ -249,29 +250,56 @@ struct CreateArgs {
 #[derive(clap::Args)]
 #[command(after_help = "\
 EXAMPLES:
-  Single-table lookup:
-    preimage lookup -a md5 -i index.idx -d words.txt 5d41402abc4b2a76b9719d911017c592
+  NTLM/index search:
+    preimage search -a ntlm -c ntlm.idx -d words.txt <hash>
 
-  Multi-table lookup:
-    preimage lookup --config tables.toml --early-exit 5d41402abc4b2a76b9719d911017c592")]
-struct LookupArgs {
-    /// Hash algorithm (for single-table lookup)
+  CloudAP / mode 33700 search:
+    preimage search -c words.cloudap33700.pim -d words.txt '$MSONLINEACCOUNT$0$10000$...'
+
+  Config search:
+    preimage search --config tables.toml <target>
+
+DEFAULT CONFIG:
+  Put algorithm, cache and dictionary in the user config file and then run:
+    preimage search <target>
+
+  Linux:   $XDG_CONFIG_HOME/preimage/config.toml or ~/.config/preimage/config.toml
+  Windows: %APPDATA%\\preimage\\config.toml
+  PREIMAGE_CONFIG can point to another file. CLI -a/-c/-d values override defaults.")]
+struct SearchArgs {
+    /// Hash algorithm for ordinary indexes (not needed for CloudAP targets)
     #[arg(short, long)]
     algorithm: Option<String>,
-    /// Index file path (for single-table lookup)
-    #[arg(short, long)]
-    index: Option<PathBuf>,
-    /// Dictionary/wordlist file path (for single-table lookup)
-    #[arg(short, long)]
+    /// Precomputed cache/index file
+    #[arg(short = 'c', long)]
+    cache: Option<PathBuf>,
+    /// Dictionary/wordlist paired with the cache/index
+    #[arg(short = 'd', long)]
     dictionary: Option<PathBuf>,
-    /// Config file path (for multi-table lookup)
-    #[arg(short, long)]
+    /// Config file for a set of caches/indexes
+    #[arg(long)]
     config: Option<PathBuf>,
-    /// Stop after first full match per hash
+    /// Read one CloudAP target from a file
+    #[arg(long)]
+    target_file: Option<PathBuf>,
+    /// Return every CloudAP duplicate instead of stopping at the first hit
+    #[arg(long)]
+    all: bool,
+    /// Worker threads for CloudAP scans; 0 uses all available logical CPUs
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+    /// Stop after first full match per hash when searching an index config
     #[arg(long)]
     early_exit: bool,
-    /// Hex-encoded hash(es) to look up
-    hashes: Vec<String>,
+    /// Hash/CloudAP target(s) to search
+    targets: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DefaultSearchConfig {
+    algorithm: String,
+    cache: PathBuf,
+    dictionary: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -281,14 +309,20 @@ fn main() -> Result<()> {
         Commands::Create(args) => cmd_create(args),
         Commands::Sort { memory, ram, index } => cmd_sort(memory, ram, &index),
         Commands::Check { index } => cmd_check(&index),
-        Commands::Lookup(args) => cmd_lookup(args),
+        Commands::Search(args) => cmd_search(args),
         Commands::Cloudap { command } => cmd_cloudap(command),
         Commands::List => cmd_algorithms(),
     }
 }
 
 fn algorithm_from_name(name: &str) -> &'static dyn HashAlgorithm {
-    get_algorithm(name).unwrap_or_else(|| {
+    let algorithm = get_algorithm(name).or_else(|| {
+        ALGORITHM_NAMES
+            .iter()
+            .find(|candidate| candidate.eq_ignore_ascii_case(name))
+            .and_then(|candidate| get_algorithm(candidate))
+    });
+    algorithm.unwrap_or_else(|| {
         eprintln!("Unknown algorithm: {name}");
         eprintln!("Run 'preimage list' to see supported algorithms.");
         process::exit(1);
@@ -401,7 +435,7 @@ fn create_combined(
     println!("Next:");
     println!("  preimage sort {}", index_path.display());
     println!(
-        "  preimage lookup -a {} -i {} -d {} <hash>",
+        "  preimage search -a {} -c {} -d {} <hash>",
         algorithm_name,
         index_path.display(),
         dict_path.display()
@@ -463,7 +497,7 @@ fn create_separate(
         println!("  preimage sort {}", table.index.display());
     }
     println!(
-        "Then: preimage lookup --config {} <hash>",
+        "Then: preimage search --config {} <hash>",
         config_path.display()
     );
     Ok(())
@@ -698,14 +732,7 @@ fn cmd_cloudap_build(args: CloudapBuildArgs) -> Result<()> {
             if args.out_dir.is_some() || args.config.is_some() {
                 bail!("--out-dir/--config are only valid with --dir");
             }
-            build_one_cloudap_cache(
-                wordlist,
-                output,
-                args.iterations,
-                args.threads,
-                args.backend,
-                args.fresh,
-            )
+            build_one_cloudap_cache(wordlist, output, args.iterations, args.threads, args.fresh)
         }
         (None, Some(dir)) => {
             if args.output.is_some() {
@@ -767,7 +794,6 @@ fn cmd_cloudap_build(args: CloudapBuildArgs) -> Result<()> {
                         &cache,
                         args.iterations,
                         args.threads,
-                        args.backend,
                         args.fresh,
                     )?;
                 }
@@ -790,7 +816,7 @@ fn cmd_cloudap_build(args: CloudapBuildArgs) -> Result<()> {
                 config_path.display()
             );
             println!(
-                "Scan with: preimage cloudap scan --config {} --target-file cloudap-33700.hash",
+                "Search with: preimage search --config {} --target-file cloudap-33700.hash",
                 config_path.display()
             );
             Ok(())
@@ -803,19 +829,11 @@ fn build_one_cloudap_cache(
     cache: &Path,
     iterations: u32,
     threads: usize,
-    backend: CloudapBuildBackend,
     fresh: bool,
 ) -> Result<()> {
     let cuda_devices = cloudap_cuda_device_count().unwrap_or(0);
-    let resolved = match backend {
-        CloudapBuildBackend::Cuda => "cuda",
-        CloudapBuildBackend::Cpu => "cpu",
-        CloudapBuildBackend::Auto if cuda_devices > 0 => "cuda",
-        CloudapBuildBackend::Auto => "cpu",
-    };
-    println!(
-        "CloudAP build starting: backend={resolved} (requested={backend}, CUDA devices={cuda_devices})"
-    );
+    let resolved = if cuda_devices > 0 { "cuda" } else { "cpu" };
+    println!("CloudAP build starting: backend={resolved} (CUDA devices={cuda_devices})");
     println!("  input:  {}", dictionary.display());
     println!("  output: {}", cache.display());
 
@@ -827,7 +845,7 @@ fn build_one_cloudap_cache(
         iterations,
         threads,
         fresh,
-        backend,
+        CloudapBuildBackend::Auto,
         Some(&pb),
     )?;
     pb.finish_and_clear();
@@ -850,7 +868,11 @@ fn cmd_cloudap_scan(args: CloudapScanArgs) -> Result<()> {
         (None, Some(path)) => {
             let contents = std::fs::read_to_string(path)
                 .with_context(|| format!("read CloudAP target file {}", path.display()))?;
-            let targets: Vec<&str> = contents.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+            let targets: Vec<&str> = contents
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect();
             if targets.len() != 1 {
                 bail!(
                     "CloudAP target file {} must contain exactly one non-empty target; found {}",
@@ -873,10 +895,10 @@ fn cmd_cloudap_scan(args: CloudapScanArgs) -> Result<()> {
             let matches = table.scan_with_threads(&target, limit, args.threads, Some(&pb))?;
             pb.finish_and_clear();
             if matches.is_empty() {
-                println!("NOT FOUND");
+                print_password_not_found();
             } else {
                 for found in matches {
-                    println!("{}", found.plaintext);
+                    print_password_found(&found.plaintext);
                 }
             }
             Ok(())
@@ -888,13 +910,12 @@ fn cmd_cloudap_scan(args: CloudapScanArgs) -> Result<()> {
                 let table = CloudapCache::open(&table_config.cache, &table_config.dictionary)?;
                 let pb = cloudap_scan_progress_bar();
                 pb.set_message(table_config.label.clone());
-                let matches =
-                    table.scan_with_threads(&target, limit, args.threads, Some(&pb))?;
+                let matches = table.scan_with_threads(&target, limit, args.threads, Some(&pb))?;
                 pb.finish_and_clear();
                 if !matches.is_empty() {
                     found_any = true;
                     for found in matches {
-                        println!("{}\t{}", table_config.label, found.plaintext);
+                        print_password_found(&found.plaintext);
                     }
                     if !args.all {
                         break;
@@ -902,7 +923,7 @@ fn cmd_cloudap_scan(args: CloudapScanArgs) -> Result<()> {
                 }
             }
             if !found_any {
-                println!("NOT FOUND");
+                print_password_not_found();
             }
             Ok(())
         }
@@ -920,21 +941,211 @@ fn cmd_cloudap_check(args: CloudapCheckArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_lookup(args: LookupArgs) -> Result<()> {
-    if args.hashes.is_empty() {
-        bail!("No hashes provided. Pass one or more hex-encoded hashes, e.g.:\n  preimage lookup -a md5 -i index.idx -d words.txt 5d41402abc4b2a76b9719d911017c592");
+fn print_password_found(password: &str) {
+    println!(
+        "{}",
+        style(format!("Password found: {password}")).green().bold()
+    );
+}
+
+fn print_password_not_found() {
+    println!("{}", style("Password not found").red().bold());
+}
+
+fn read_single_target_file(path: &Path) -> Result<String> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("read target file {}", path.display()))?;
+    let targets: Vec<&str> = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if targets.len() != 1 {
+        bail!(
+            "target file {} must contain exactly one non-empty target; found {}",
+            path.display(),
+            targets.len()
+        );
+    }
+    Ok(targets[0].to_string())
+}
+
+fn default_search_config_path() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("PREIMAGE_CONFIG") {
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
     }
 
-    if let Some(config_path) = &args.config {
-        return lookup_with_config(config_path, &args.hashes, args.early_exit);
-    }
-
-    if let (Some(alg_name), Some(index_path), Some(dict_path)) =
-        (&args.algorithm, &args.index, &args.dictionary)
+    #[cfg(windows)]
     {
-        lookup_single(alg_name, index_path, dict_path, &args.hashes)
+        if let Some(appdata) = env::var_os("APPDATA") {
+            return Some(PathBuf::from(appdata).join("preimage").join("config.toml"));
+        }
+        if let Some(profile) = env::var_os("USERPROFILE") {
+            return Some(
+                PathBuf::from(profile)
+                    .join(".config")
+                    .join("preimage")
+                    .join("config.toml"),
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(xdg).join("preimage").join("config.toml"));
+        }
+        if let Some(home) = env::var_os("HOME") {
+            return Some(
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("preimage")
+                    .join("config.toml"),
+            );
+        }
+    }
+
+    None
+}
+
+fn load_default_search_config() -> Result<Option<(PathBuf, DefaultSearchConfig)>> {
+    let Some(path) = default_search_config_path() else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        if env::var_os("PREIMAGE_CONFIG").is_some() {
+            bail!("PREIMAGE_CONFIG points to missing file {}", path.display());
+        }
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("read default Preimage config {}", path.display()))?;
+    let mut config: DefaultSearchConfig = toml::from_str(&contents)
+        .with_context(|| format!("parse default Preimage config {}", path.display()))?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    if config.cache.is_relative() {
+        config.cache = base.join(&config.cache);
+    }
+    if config.dictionary.is_relative() {
+        config.dictionary = base.join(&config.dictionary);
+    }
+    Ok(Some((path, config)))
+}
+
+fn default_algorithm_is_cloudap(algorithm: &str) -> bool {
+    matches!(
+        algorithm.to_ascii_lowercase().as_str(),
+        "cloudap" | "33700" | "msonlineaccount"
+    )
+}
+
+fn apply_default_search_config(args: &mut SearchArgs, cloudap: bool) -> Result<()> {
+    let explicit_search_complete = if cloudap {
+        args.cache.is_some() && args.dictionary.is_some()
     } else {
-        bail!("Provide either --config for multi-table lookup, or --algorithm, --index, and --dictionary for single-table lookup.");
+        args.algorithm.is_some() && args.cache.is_some() && args.dictionary.is_some()
+    };
+    if args.config.is_some() || explicit_search_complete {
+        return Ok(());
+    }
+    let Some((_path, default)) = load_default_search_config()? else {
+        return Ok(());
+    };
+
+    let default_is_cloudap = default_algorithm_is_cloudap(&default.algorithm);
+    if default_is_cloudap != cloudap {
+        return Ok(());
+    }
+    if !cloudap {
+        if let Some(algorithm) = args.algorithm.as_deref() {
+            if !algorithm.eq_ignore_ascii_case(&default.algorithm) {
+                return Ok(());
+            }
+        }
+    }
+
+    if args.cache.is_none() {
+        args.cache = Some(default.cache);
+    }
+    if args.dictionary.is_none() {
+        args.dictionary = Some(default.dictionary);
+    }
+    if !cloudap && args.algorithm.is_none() {
+        args.algorithm = Some(default.algorithm);
+    }
+
+    Ok(())
+}
+
+fn cmd_search(mut args: SearchArgs) -> Result<()> {
+    if let Some(path) = args.target_file.as_ref() {
+        if !args.targets.is_empty() {
+            bail!("pass a target argument or --target-file, not both");
+        }
+        args.targets.push(read_single_target_file(path)?);
+    }
+
+    if args.targets.is_empty() {
+        bail!("no target provided");
+    }
+
+    let cloudap_count = args
+        .targets
+        .iter()
+        .filter(|target| target.starts_with("$MSONLINEACCOUNT$0$"))
+        .count();
+    if cloudap_count > 0 && cloudap_count != args.targets.len() {
+        bail!("do not mix CloudAP and ordinary hash targets in one search");
+    }
+
+    let is_cloudap = cloudap_count == args.targets.len();
+    apply_default_search_config(&mut args, is_cloudap)?;
+
+    if is_cloudap {
+        if args.targets.len() != 1 {
+            bail!("CloudAP search accepts one target at a time");
+        }
+        if args.algorithm.is_some() {
+            bail!("--algorithm is not needed for a CloudAP target");
+        }
+        return cmd_cloudap_scan(CloudapScanArgs {
+            cache: args.cache,
+            dictionary: args.dictionary,
+            config: args.config,
+            target_file: None,
+            all: args.all,
+            threads: args.threads,
+            target: args.targets.pop(),
+        });
+    }
+
+    if args.target_file.is_some() {
+        bail!("--target-file is currently supported for CloudAP targets");
+    }
+    if args.all {
+        bail!("--all is only valid for CloudAP searches");
+    }
+    if args.threads != 0 {
+        bail!("--threads is only valid for CloudAP searches");
+    }
+
+    if let Some(config_path) = args.config.as_ref() {
+        if args.cache.is_some() || args.dictionary.is_some() || args.algorithm.is_some() {
+            bail!("use either --config or -a/-c/-d, not both");
+        }
+        return lookup_with_config(config_path, &args.targets, args.early_exit);
+    }
+
+    if let (Some(algorithm), Some(cache), Some(dictionary)) = (
+        args.algorithm.as_deref(),
+        args.cache.as_deref(),
+        args.dictionary.as_deref(),
+    ) {
+        lookup_single(algorithm, cache, dictionary, &args.targets)
+    } else {
+        bail!("ordinary hash search requires -a <algorithm> -c <cache/index> -d <dictionary>");
     }
 }
 
@@ -949,21 +1160,14 @@ fn lookup_single(
 
     for hash_hex in hashes {
         let matches = table.lookup(hash_hex)?;
-        if matches.is_empty() {
-            println!("{hash_hex}: NOT FOUND");
-        } else {
-            for m in &matches {
-                let plaintext = m.plaintext_lossy();
-                if m.is_full() {
-                    println!("{hash_hex}: {plaintext} [{}]", m.algorithm().name());
-                } else {
-                    println!(
-                        "{hash_hex}: {plaintext} [{}] (partial, full hash: {})",
-                        m.algorithm().name(),
-                        hex::encode(m.recomputed_hash())
-                    );
-                }
-            }
+        let mut found = false;
+        for matched in matches.iter().filter(|matched| matched.is_full()) {
+            found = true;
+            let plaintext = matched.plaintext_lossy();
+            print_password_found(&plaintext);
+        }
+        if !found {
+            print_password_not_found();
         }
     }
     Ok(())
@@ -1010,41 +1214,20 @@ fn lookup_with_config(config_path: &PathBuf, hashes: &[String], early_exit: bool
     for result in &results {
         match result {
             HashResult::InvalidFormat { input } => {
-                println!("{}: INVALID FORMAT", input);
+                println!("{}", style(format!("Invalid target: {input}")).red().bold());
             }
-            HashResult::Lookup {
-                queried_hash,
-                matches,
-                ..
-            } if matches.is_empty() => {
-                println!("{}: NOT FOUND", queried_hash);
-            }
-            HashResult::Lookup {
-                queried_hash,
-                matches,
-                ..
-            } => {
-                for m in matches {
-                    let lm = &m.lookup_match;
-                    let plaintext = lm.plaintext_lossy();
-                    if lm.is_full() {
-                        println!(
-                            "{}: {} [{}] ({})",
-                            queried_hash,
-                            plaintext,
-                            m.table_label,
-                            lm.algorithm().name()
-                        );
-                    } else {
-                        println!(
-                            "{}: {} [{}] ({}, partial, full hash: {})",
-                            queried_hash,
-                            plaintext,
-                            m.table_label,
-                            lm.algorithm().name(),
-                            hex::encode(lm.recomputed_hash())
-                        );
-                    }
+            HashResult::Lookup { matches, .. } => {
+                let mut found = false;
+                for matched in matches
+                    .iter()
+                    .filter(|matched| matched.lookup_match.is_full())
+                {
+                    found = true;
+                    let plaintext = matched.lookup_match.plaintext_lossy();
+                    print_password_found(&plaintext);
+                }
+                if !found {
+                    print_password_not_found();
                 }
             }
         }

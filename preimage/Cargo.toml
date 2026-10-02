@@ -19,6 +19,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 memmap2 = "0.9"
 anyhow = "1"
 indicatif = "0.17"
+console = "0.15"
 hex = "0.4"
 aes = "0.8"
 pbkdf2 = "0.12"
