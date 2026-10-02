@@ -247,11 +247,13 @@ PBKDF2-HMAC-SHA256(UTF-16LE(password), salt="", iterations=10000, dkLen=32)
 
 There is no per-target salt, so the expensive PBKDF2 result for a candidate is
 reusable across CloudAP targets. The target does **not** expose that derived key,
-so it cannot use Preimage's normal sorted/binary-search index. Instead,
-`preimage cloudap` stores fixed 38-byte records containing the 32-byte derived key
-plus a 48-bit byte offset into the original dictionary. A target scan streams
-those records and performs only the inexpensive target-specific AES marker check.
-The dictionary is consulted only after a key matches.
+so it cannot use Preimage's normal sorted/binary-search index. By default,
+`preimage cloudap` writes legacy v1 fixed 38-byte records containing the 32-byte
+derived key plus a 48-bit byte offset into the original dictionary. With
+`--compact-cache`, it writes **PIM v2**: fixed 32-byte derived-key records and a
+tiny sibling `<cache>.ord` accepted-candidate ordinal sidecar. The sidecar uses
+checkpoints every 65,536 valid-UTF8 candidates, so target scans still stream only
+the compact PIM; dictionary/sidecar lookup happens only after a key matches.
 
 Each completed cache is strongly bound to the exact dictionary by size and full
 SHA-256. The build writes `<cache>.part` and flushes progress in bounded windows;
@@ -264,6 +266,12 @@ resumes from the last completed candidate. No sort step is required.
 preimage cloudap build \
   --wordlist words.txt \
   --output words.cloudap33700.pim
+
+# Compact PIM v2: 32-byte records + words.cloudap33700.pim.ord sidecar
+preimage cloudap build \
+  --wordlist words.txt \
+  --output words.cloudap33700.pim \
+  --compact-cache
 ```
 
 `--threads 0` (the default) uses every available logical CPU. `--fresh` discards
@@ -283,9 +291,11 @@ preimage cloudap build \
   --output words.cloudap33700.pim
 ```
 
-The CPU and CUDA builders write the same version-1 cache records, so a partial
-single-GPU build can be resumed with a multi-GPU binary as long as the dictionary,
-iteration count, and output path are unchanged; do not use `--fresh` when resuming.
+The CPU and CUDA builders share the same record-ordering logic. Legacy builds write
+version-1 records; `--compact-cache` writes version-2 32-byte records plus the ordinal
+sidecar. Partial v2 builds resume from accepted-candidate ordinal checkpoints rather
+than embedded offsets. Cross-backend byte-identity tests cover both cache versions;
+the CUDA-specific test runs when a CUDA-capable build/host is available.
 CUDA accelerates
 the 10,000-round PBKDF2 build; it does not materially help the later cache scan,
 which streams already-derived keys and is normally limited by memory/storage I/O.

@@ -25,10 +25,14 @@ use memmap2::Mmap;
 use pbkdf2::pbkdf2_hmac;
 use sha2::{Digest, Sha256};
 
+use crate::cloudap_ordinal::OrdinalIndex;
+
 const MAGIC: &[u8; 8] = b"PIMC337\0";
-const VERSION: u32 = 1;
+const VERSION_V1: u32 = 1;
+const VERSION_V2: u32 = 2;
 const HEADER_SIZE: usize = 64;
-const RECORD_SIZE: usize = 38;
+const V1_RECORD_SIZE: usize = 38;
+const V2_RECORD_SIZE: usize = 32;
 const KEY_SIZE: usize = 32;
 const OFFSET_SIZE: usize = 6;
 const DEFAULT_WINDOW_BYTES: usize = 4 << 20;
@@ -38,6 +42,36 @@ const MAX_DICTIONARY_OFFSET: u64 = 1u64 << 48;
 
 /// Current Windows CloudAP mode-33700 iteration count.
 pub const DEFAULT_CLOUDAP_ITERATIONS: u32 = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloudapCacheFormat {
+    LegacyV1,
+    CompactV2,
+}
+
+impl CloudapCacheFormat {
+    const fn version(self) -> u32 {
+        match self {
+            Self::LegacyV1 => VERSION_V1,
+            Self::CompactV2 => VERSION_V2,
+        }
+    }
+
+    const fn record_size(self) -> usize {
+        match self {
+            Self::LegacyV1 => V1_RECORD_SIZE,
+            Self::CompactV2 => V2_RECORD_SIZE,
+        }
+    }
+
+    fn from_version(version: u32) -> Result<Self> {
+        match version {
+            VERSION_V1 => Ok(Self::LegacyV1),
+            VERSION_V2 => Ok(Self::CompactV2),
+            _ => bail!("unsupported CloudAP cache version {version}"),
+        }
+    }
+}
 
 /// KDF implementation used while building a CloudAP cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +187,7 @@ pub struct CloudapBuildStats {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Header {
+    version: u32,
     iterations: u32,
     dictionary_len: u64,
     dictionary_sha256: [u8; 32],
@@ -163,7 +198,7 @@ impl Header {
     fn encode(&self) -> [u8; HEADER_SIZE] {
         let mut bytes = [0u8; HEADER_SIZE];
         bytes[0..8].copy_from_slice(MAGIC);
-        bytes[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.version.to_le_bytes());
         bytes[12..16].copy_from_slice(&self.iterations.to_le_bytes());
         bytes[16..24].copy_from_slice(&self.dictionary_len.to_le_bytes());
         bytes[24..56].copy_from_slice(&self.dictionary_sha256);
@@ -179,15 +214,14 @@ impl Header {
             bail!("not a Preimage CloudAP cache");
         }
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        if version != VERSION {
-            bail!("unsupported CloudAP cache version {version}");
-        }
+        CloudapCacheFormat::from_version(version)?;
         let iterations = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
         let dictionary_len = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
         let mut dictionary_sha256 = [0u8; 32];
         dictionary_sha256.copy_from_slice(&bytes[24..56]);
         let record_count = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
         Ok(Self {
+            version,
             iterations,
             dictionary_len,
             dictionary_sha256,
@@ -203,6 +237,7 @@ pub struct CloudapCache {
     header: Header,
     cache_mmap: Mmap,
     dictionary_mmap: Option<Mmap>,
+    ordinal_index: Option<OrdinalIndex>,
 }
 
 impl CloudapCache {
@@ -239,6 +274,50 @@ impl CloudapCache {
         backend: CloudapBuildBackend,
         progress: Option<&ProgressBar>,
     ) -> Result<CloudapBuildStats> {
+        Self::build_with_backend_format(
+            dictionary_path,
+            output_path,
+            iterations,
+            threads,
+            fresh,
+            backend,
+            CloudapCacheFormat::LegacyV1,
+            progress,
+        )
+    }
+
+    /// Build compact PIM v2 (32-byte derived-key records plus an ordinal sidecar).
+    pub fn build_compact_with_backend(
+        dictionary_path: &Path,
+        output_path: &Path,
+        iterations: u32,
+        threads: usize,
+        fresh: bool,
+        backend: CloudapBuildBackend,
+        progress: Option<&ProgressBar>,
+    ) -> Result<CloudapBuildStats> {
+        Self::build_with_backend_format(
+            dictionary_path,
+            output_path,
+            iterations,
+            threads,
+            fresh,
+            backend,
+            CloudapCacheFormat::CompactV2,
+            progress,
+        )
+    }
+
+    fn build_with_backend_format(
+        dictionary_path: &Path,
+        output_path: &Path,
+        iterations: u32,
+        threads: usize,
+        fresh: bool,
+        backend: CloudapBuildBackend,
+        format: CloudapCacheFormat,
+        progress: Option<&ProgressBar>,
+    ) -> Result<CloudapBuildStats> {
         if iterations == 0 {
             bail!("CloudAP iteration count must be non-zero");
         }
@@ -246,7 +325,7 @@ impl CloudapCache {
         let dictionary_file = File::open(dictionary_path)
             .with_context(|| format!("open dictionary {}", dictionary_path.display()))?;
         let dictionary_len = dictionary_file.metadata()?.len();
-        if dictionary_len >= MAX_DICTIONARY_OFFSET {
+        if format == CloudapCacheFormat::LegacyV1 && dictionary_len >= MAX_DICTIONARY_OFFSET {
             bail!("dictionary is too large for the 48-bit cache offset format");
         }
         if output_path.exists() && !fresh {
@@ -261,19 +340,32 @@ impl CloudapCache {
 
         if dictionary_len == 0 {
             // Mapping an empty file is platform-dependent. Its SHA-256 is stable.
-            return build_empty_cache(dictionary_path, output_path, iterations, backend, fresh);
+            return build_empty_cache(
+                dictionary_path,
+                output_path,
+                iterations,
+                backend,
+                format,
+                fresh,
+            );
         }
 
         // SAFETY: same static-input assumption as the regular Preimage builder.
         let dictionary_mmap = unsafe { Mmap::map(&dictionary_file)? };
         let dictionary_sha256: [u8; 32] = Sha256::digest(&dictionary_mmap).into();
         let expected_header = Header {
+            version: format.version(),
             iterations,
             dictionary_len,
             dictionary_sha256,
             record_count: 0,
         };
         let partial_path = partial_path(output_path);
+        let ordinal_index = if format == CloudapCacheFormat::CompactV2 {
+            Some(OrdinalIndex::ensure_for_dictionary(output_path, dictionary_path)?)
+        } else {
+            None
+        };
 
         if fresh {
             let _ = std::fs::remove_file(output_path);
@@ -298,6 +390,8 @@ impl CloudapCache {
             &expected_header,
             &dictionary_mmap,
             dictionary_len,
+            format,
+            ordinal_index.as_ref(),
         )?;
         let mut records = resumed_records;
         let mut invalid_utf8_lines = 0u64;
@@ -328,7 +422,7 @@ impl CloudapCache {
                     let handles: Vec<_> = ranges
                         .iter()
                         .map(|&(start, end)| {
-                            scope.spawn(move || process_range(data, start, end, iterations))
+                            scope.spawn(move || process_range(data, start, end, iterations, format))
                         })
                         .collect();
                     handles
@@ -337,7 +431,7 @@ impl CloudapCache {
                         .collect::<Vec<_>>()
                 }),
                 CloudapBuildBackend::Cuda => {
-                    vec![process_cuda_ranges(data, &ranges, iterations)?]
+                    vec![process_cuda_ranges(data, &ranges, iterations, format)?]
                 }
                 CloudapBuildBackend::Auto => unreachable!("backend is resolved before building"),
             };
@@ -354,6 +448,16 @@ impl CloudapCache {
                 pb.set_position(wend as u64);
             }
             wstart = wend;
+        }
+
+        if let Some(index) = ordinal_index.as_ref() {
+            if records != index.accepted_count() {
+                bail!(
+                    "compact CloudAP build produced {records} records but ordinal sidecar {} describes {} accepted candidates",
+                    index.path().display(),
+                    index.accepted_count()
+                );
+            }
         }
 
         let mut partial = output.into_inner().map_err(|e| e.into_error())?;
@@ -394,10 +498,11 @@ impl CloudapCache {
         // SAFETY: read-only static cache under the same trust model as Preimage indexes.
         let cache_mmap = unsafe { Mmap::map(&cache_file)? };
         let header = Header::decode(&cache_mmap[..HEADER_SIZE])?;
+        let format = CloudapCacheFormat::from_version(header.version)?;
         let expected_len = HEADER_SIZE as u64
             + header
                 .record_count
-                .checked_mul(RECORD_SIZE as u64)
+                .checked_mul(format.record_size() as u64)
                 .context("CloudAP record count overflows file length")?;
         if cache_len != expected_len {
             bail!(
@@ -430,12 +535,22 @@ impl CloudapCache {
             Some(mmap)
         };
 
+        let ordinal_index = if format == CloudapCacheFormat::CompactV2 {
+            let sidecar = OrdinalIndex::path_for_cache(cache_path);
+            Some(OrdinalIndex::open(&sidecar, dictionary_path).with_context(|| {
+                format!("open CloudAP ordinal sidecar {}", sidecar.display())
+            })?)
+        } else {
+            None
+        };
+
         Ok(Self {
             cache_path: cache_path.to_path_buf(),
             dictionary_path: dictionary_path.to_path_buf(),
             header,
             cache_mmap,
             dictionary_mmap,
+            ordinal_index,
         })
     }
 
@@ -491,6 +606,8 @@ impl CloudapCache {
         }
 
         let records = &self.cache_mmap[HEADER_SIZE..];
+        let format = CloudapCacheFormat::from_version(self.header.version)?;
+        let record_size = format.record_size();
         let record_count = usize::try_from(self.header.record_count)
             .context("CloudAP record count does not fit this platform")?;
         if record_count == 0 {
@@ -527,15 +644,12 @@ impl CloudapCache {
                                 if limit == 1 && index >= best_match.load(Ordering::Relaxed) {
                                     break;
                                 }
-                                let record_start = index * RECORD_SIZE;
+                                let record_start = index * record_size;
                                 let record =
-                                    &records[record_start..record_start + RECORD_SIZE];
+                                    &records[record_start..record_start + record_size];
                                 scanned += 1;
                                 if target.verify_derived_key_bytes(&record[..KEY_SIZE]) {
-                                    let offset = decode_offset(
-                                        &record[KEY_SIZE..KEY_SIZE + OFFSET_SIZE],
-                                    );
-                                    local_matches.push((index, offset));
+                                    local_matches.push(index);
                                     if limit == 1 {
                                         best_match.fetch_min(index, Ordering::Relaxed);
                                         break;
@@ -559,7 +673,7 @@ impl CloudapCache {
                 })
                 .collect::<Vec<_>>()
         });
-        indexed_matches.sort_unstable_by_key(|&(index, _)| index);
+        indexed_matches.sort_unstable();
         if limit != 0 {
             indexed_matches.truncate(limit);
         } else if let Some(pb) = progress {
@@ -568,9 +682,18 @@ impl CloudapCache {
 
         let dictionary = self.dictionary_mmap.as_deref();
         let mut matches = Vec::with_capacity(indexed_matches.len());
-        for (_, offset) in indexed_matches {
+        for index in indexed_matches {
             let dictionary = dictionary
                 .context("CloudAP cache matched a key but its dictionary is empty")?;
+            let offset = if format == CloudapCacheFormat::LegacyV1 {
+                let record_start = index * record_size;
+                decode_offset(&records[record_start + KEY_SIZE..record_start + KEY_SIZE + OFFSET_SIZE])
+            } else {
+                self.ordinal_index
+                    .as_ref()
+                    .context("compact CloudAP cache is missing its ordinal sidecar")?
+                    .resolve_offset(dictionary, index as u64)?
+            };
             matches.push(CloudapMatch {
                 dictionary_offset: offset,
                 plaintext: dictionary_word(dictionary, offset)?,
@@ -593,7 +716,13 @@ struct ProcessedChunk {
     invalid_utf8_lines: u64,
 }
 
-fn process_range(data: &[u8], start: usize, end: usize, iterations: u32) -> ProcessedChunk {
+fn process_range(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    iterations: u32,
+    format: CloudapCacheFormat,
+) -> ProcessedChunk {
     let mut result = ProcessedChunk::default();
     let mut pos = start;
     let mut utf16 = Vec::with_capacity(128);
@@ -619,7 +748,9 @@ fn process_range(data: &[u8], start: usize, end: usize, iterations: u32) -> Proc
                 let mut key = [0u8; KEY_SIZE];
                 pbkdf2_hmac::<Sha256>(&utf16, b"", iterations, &mut key);
                 result.bytes.extend_from_slice(&key);
-                encode_offset(pos as u64, &mut result.bytes);
+                if format == CloudapCacheFormat::LegacyV1 {
+                    encode_offset(pos as u64, &mut result.bytes);
+                }
                 result.records += 1;
             }
             Err(_) => result.invalid_utf8_lines += 1,
@@ -662,6 +793,7 @@ fn process_cuda_ranges(
     data: &[u8],
     ranges: &[(usize, usize)],
     iterations: u32,
+    format: CloudapCacheFormat,
 ) -> Result<ProcessedChunk> {
     let prepared = std::thread::scope(|scope| {
         let handles: Vec<_> = ranges
@@ -694,10 +826,12 @@ fn process_cuda_ranges(
     }
     let device_count = cuda_device_count()?;
     let derived = cuda_pbkdf2_multi(&key_blocks, offsets.len(), iterations, device_count)?;
-    let mut bytes = Vec::with_capacity(offsets.len() * RECORD_SIZE);
+    let mut bytes = Vec::with_capacity(offsets.len() * format.record_size());
     for (index, offset) in offsets.into_iter().enumerate() {
         bytes.extend_from_slice(&derived[index * KEY_SIZE..(index + 1) * KEY_SIZE]);
-        encode_offset(offset, &mut bytes);
+        if format == CloudapCacheFormat::LegacyV1 {
+            encode_offset(offset, &mut bytes);
+        }
     }
     Ok(ProcessedChunk {
         bytes,
@@ -889,6 +1023,8 @@ fn prepare_partial(
     expected_header: &Header,
     dictionary: &[u8],
     dictionary_len: u64,
+    format: CloudapCacheFormat,
+    ordinal_index: Option<&OrdinalIndex>,
 ) -> Result<(u64, u64)> {
     let len = partial.metadata()?.len();
     if len == 0 {
@@ -903,7 +1039,8 @@ fn prepare_partial(
     let mut header_bytes = [0u8; HEADER_SIZE];
     partial.read_exact(&mut header_bytes)?;
     let existing = Header::decode(&header_bytes)?;
-    if existing.iterations != expected_header.iterations
+    if existing.version != expected_header.version
+        || existing.iterations != expected_header.iterations
         || existing.dictionary_len != expected_header.dictionary_len
         || existing.dictionary_sha256 != expected_header.dictionary_sha256
     {
@@ -911,18 +1048,27 @@ fn prepare_partial(
     }
 
     let payload_len = len - HEADER_SIZE as u64;
-    let complete_payload = payload_len / RECORD_SIZE as u64 * RECORD_SIZE as u64;
+    let record_size = format.record_size() as u64;
+    let complete_payload = payload_len / record_size * record_size;
     let repaired_len = HEADER_SIZE as u64 + complete_payload;
     if repaired_len != len {
         partial.set_len(repaired_len)?;
     }
-    let records = complete_payload / RECORD_SIZE as u64;
+    let records = complete_payload / record_size;
     if records == 0 {
         return Ok((0, 0));
     }
 
+    if format == CloudapCacheFormat::CompactV2 {
+        let ordinal_index = ordinal_index.context(
+            "compact CloudAP partial resume requires the accepted-candidate ordinal sidecar",
+        )?;
+        let start = ordinal_index.resume_offset(dictionary, records)?;
+        return Ok((records, start));
+    }
+
     partial.seek(SeekFrom::Start(
-        HEADER_SIZE as u64 + (records - 1) * RECORD_SIZE as u64 + KEY_SIZE as u64,
+        HEADER_SIZE as u64 + (records - 1) * V1_RECORD_SIZE as u64 + KEY_SIZE as u64,
     ))?;
     let mut offset_bytes = [0u8; OFFSET_SIZE];
     partial.read_exact(&mut offset_bytes)?;
@@ -939,6 +1085,7 @@ fn build_empty_cache(
     output_path: &Path,
     iterations: u32,
     backend: CloudapBuildBackend,
+    format: CloudapCacheFormat,
     fresh: bool,
 ) -> Result<CloudapBuildStats> {
     if output_path.exists() && !fresh {
@@ -946,6 +1093,7 @@ fn build_empty_cache(
     }
     let digest: [u8; 32] = Sha256::digest([]).into();
     let header = Header {
+        version: format.version(),
         iterations,
         dictionary_len: 0,
         dictionary_sha256: digest,
@@ -960,6 +1108,9 @@ fn build_empty_cache(
         }
     }
     std::fs::write(output_path, header.encode())?;
+    if format == CloudapCacheFormat::CompactV2 {
+        OrdinalIndex::ensure_for_dictionary(output_path, dictionary_path)?;
+    }
     Ok(CloudapBuildStats {
         backend,
         records: 0,
@@ -1132,7 +1283,7 @@ mod tests {
         // or the current builder. This pins compatibility with the legacy on-disk layout
         // even if the writer changes when v2 support is added.
         let iterations = 8u32;
-        let mut bytes = Vec::with_capacity(HEADER_SIZE + RECORD_SIZE);
+        let mut bytes = Vec::with_capacity(HEADER_SIZE + V1_RECORD_SIZE);
         bytes.extend_from_slice(b"PIMC337\0");
         bytes.extend_from_slice(&1u32.to_le_bytes());
         bytes.extend_from_slice(&iterations.to_le_bytes());
@@ -1169,12 +1320,13 @@ mod tests {
         let first_match = SCAN_CHUNK_RECORDS - 1;
         let second_match = SCAN_CHUNK_RECORDS;
         let header = Header {
+            version: VERSION_V1,
             iterations,
             dictionary_len: dictionary.len() as u64,
             dictionary_sha256: Sha256::digest(dictionary).into(),
             record_count: record_count as u64,
         };
-        let mut bytes = Vec::with_capacity(HEADER_SIZE + record_count * RECORD_SIZE);
+        let mut bytes = Vec::with_capacity(HEADER_SIZE + record_count * V1_RECORD_SIZE);
         bytes.extend_from_slice(&header.encode());
         for index in 0..record_count {
             bytes.extend_from_slice(if index == first_match || index == second_match {
@@ -1217,6 +1369,70 @@ mod tests {
         let opened = CloudapCache::open(&cache, &words).unwrap();
         let target = CloudapTarget::parse(&target_for("CorrectHorse", 8)).unwrap();
         let found = opened.scan(&target, 1, None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].plaintext, "CorrectHorse");
+    }
+
+    #[test]
+    fn compact_v2_build_scan_and_resume_with_invalid_utf8() {
+        let dir = tempdir().unwrap();
+        let words = dir.path().join("words.txt");
+        let cache = dir.path().join("cloudap33700-v2.pim");
+        let dictionary = b"wrong\n\xff\xfe\nCorrectHorse\nanother\n";
+        std::fs::write(&words, dictionary).unwrap();
+
+        let stats = CloudapCache::build_compact_with_backend(
+            &words,
+            &cache,
+            8,
+            2,
+            false,
+            CloudapBuildBackend::Cpu,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stats.records, 3);
+        assert_eq!(stats.invalid_utf8_lines, 1);
+        assert_eq!(
+            std::fs::metadata(&cache).unwrap().len(),
+            (HEADER_SIZE + 3 * V2_RECORD_SIZE) as u64
+        );
+        assert!(OrdinalIndex::path_for_cache(&cache).exists());
+
+        let opened = CloudapCache::open(&cache, &words).unwrap();
+        let target = CloudapTarget::parse(&target_for("CorrectHorse", 8)).unwrap();
+        let found = opened.scan(&target, 1, None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].plaintext, "CorrectHorse");
+        assert_eq!(
+            found[0].dictionary_offset,
+            b"wrong\n\xff\xfe\n".len() as u64
+        );
+
+        // Recreate a torn partial containing exactly the first compact record. Resume
+        // must recover the next dictionary position from the ordinal sidecar, not from
+        // an embedded offset (v2 records have none).
+        let complete = std::fs::read(&cache).unwrap();
+        let mut partial = complete[..HEADER_SIZE + V2_RECORD_SIZE].to_vec();
+        partial.extend_from_slice(b"torn!");
+        std::fs::remove_file(&cache).unwrap();
+        std::fs::write(partial_path(&cache), partial).unwrap();
+
+        let resumed = CloudapCache::build_compact_with_backend(
+            &words,
+            &cache,
+            8,
+            2,
+            false,
+            CloudapBuildBackend::Cpu,
+            None,
+        )
+        .unwrap();
+        assert_eq!(resumed.resumed_records, 1);
+        assert_eq!(resumed.records, 3);
+
+        let reopened = CloudapCache::open(&cache, &words).unwrap();
+        let found = reopened.scan(&target, 1, None).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].plaintext, "CorrectHorse");
     }
@@ -1280,13 +1496,14 @@ mod tests {
 
         let digest: [u8; 32] = Sha256::digest(data).into();
         let header = Header {
+            version: VERSION_V1,
             iterations: 4,
             dictionary_len: data.len() as u64,
             dictionary_sha256: digest,
             record_count: 0,
         };
         let first_end = data.iter().position(|&byte| byte == b'\n').unwrap() + 1;
-        let first = process_range(data, 0, first_end, 4);
+        let first = process_range(data, 0, first_end, 4, CloudapCacheFormat::LegacyV1);
         assert_eq!(first.records, 1);
 
         let part = partial_path(&cache);
@@ -1382,8 +1599,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            std::fs::read(cpu_cache).unwrap(),
-            std::fs::read(cuda_cache).unwrap()
+            std::fs::read(&cpu_cache).unwrap(),
+            std::fs::read(&cuda_cache).unwrap()
+        );
+
+        let cpu_v2 = dir.path().join("cpu-v2.pim");
+        let cuda_v2 = dir.path().join("cuda-v2.pim");
+        CloudapCache::build_compact_with_backend(
+            &words,
+            &cpu_v2,
+            8,
+            2,
+            false,
+            CloudapBuildBackend::Cpu,
+            None,
+        )
+        .unwrap();
+        CloudapCache::build_compact_with_backend(
+            &words,
+            &cuda_v2,
+            8,
+            2,
+            false,
+            CloudapBuildBackend::Cuda,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&cpu_v2).unwrap(),
+            std::fs::read(&cuda_v2).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(OrdinalIndex::path_for_cache(&cpu_v2)).unwrap(),
+            std::fs::read(OrdinalIndex::path_for_cache(&cuda_v2)).unwrap()
         );
     }
 }

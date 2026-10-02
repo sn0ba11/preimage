@@ -61,7 +61,7 @@ Do not merge a storage optimisation that materially regresses this without expli
 
 ## Start here — easy work for Claude
 
-The first implementation target is **PIM v2**.
+The PIM v2 implementation is now complete on the CPU path and format-compatible with the existing v1 reader.
 
 ### PIM v2 design
 
@@ -99,24 +99,26 @@ The CloudAP cache is generated in dictionary order.
 
 Do **not** define record N as raw dictionary line N. Define it as the N-th **accepted CloudAP candidate** (valid UTF-8 under the current semantics).
 
-The intended v2 design remains to remove the byte offset. The sparse sidecar must therefore map accepted-candidate ordinal → dictionary byte offset and skip invalid-UTF8 lines during forward resolution.
+Implemented v2 removes the per-record byte offset. A sibling `<cache>.ord` sidecar maps accepted-candidate ordinal → dictionary byte offset using a 65,536-candidate checkpoint stride and skips invalid-UTF8 lines during bounded forward resolution.
 
 After a hit, Preimage can resolve ordinal N back to plaintext through a sparse dictionary index.
 
 The ordinal lookup is not part of the full scan hot path.
 
-### Implementation order
+### Implementation status
 
-1. Record/reconcile production counts, provenance and reproducible performance baselines.
-2. Inventory and strengthen existing v1 compatibility evidence.
-3. Implement the easy 5-byte-offset IDX v2 as an independent low-risk win.
-4. Add the sparse accepted-candidate-ordinal sidecar.
-5. Introduce explicit PIM v2 version handling.
-6. Make v2 records exactly 32 bytes and update scan/check paths.
-7. Update CPU and CUDA builders for v2.
-8. Update resume/torn-record repair to use the sidecar rather than rescanning the full dictionary.
-9. Test CPU/CUDA byte identity and cross-backend resume, including >64-byte UTF-16 HMAC keys.
-10. Benchmark v1 vs v2.
+Completed:
+1. Production counts and storage baseline recorded.
+2. v1 compatibility pinned with immutable/writer-independent evidence.
+3. IDX2 5-byte offsets implemented.
+4. Sparse accepted-candidate ordinal sidecar implemented.
+5. Explicit PIM v2/version 2 support implemented.
+6. v2 records are exactly 32 bytes; open/check/search understand both versions.
+7. CPU v2 builder implemented; CUDA v2 path uses the same record ordering logic.
+8. v2 torn-record repair/resume uses the sidecar rather than rescanning the dictionary.
+9. Conditional CUDA test covers CPU/CUDA byte identity for v2 cache + sidecar, including long UTF-16 passwords; it still needs execution on a CUDA-capable host.
+
+Next: benchmark production v1 vs v2 on Comino (PRE-013), then recompress the real v2 dataset and record the actual deployed footprint.
 
 Do not remove v1 support.
 
@@ -238,6 +240,6 @@ Start with PRE-001 and PRE-002:
 - reconcile counts/provenance and record a reproducible baseline
 - inventory and strengthen the existing compatibility evidence
 
-PRE-029 (5-byte-offset IDX2) is complete. The next task is PRE-011: the accepted-candidate ordinal sidecar needed by PIM v2 and fast resume. That is the first genuinely moderate item after the completed easy wins.
+PRE-029, PRE-010 and PRE-011 are complete. PRE-012 is implemented with CPU validation complete and CUDA runtime validation pending on a CUDA-capable host. The next active task is **PRE-013: production PIM v1 vs v2 benchmarking on Comino**, followed by rebuilding/recompressing the production v2 cache to measure the real storage saving.
 
 Do not jump into the succinct NTLM work until the easy v2 reductions are proven and benchmarked.

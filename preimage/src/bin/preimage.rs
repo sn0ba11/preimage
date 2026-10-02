@@ -162,6 +162,9 @@ struct CloudapBuildArgs {
     /// Discard completed/partial output and rebuild from the beginning
     #[arg(long)]
     fresh: bool,
+    /// Write compact PIM v2 (32-byte key records + accepted-candidate ordinal sidecar).
+    #[arg(long)]
+    compact_cache: bool,
 }
 
 #[derive(clap::Args)]
@@ -768,7 +771,14 @@ fn cmd_cloudap_build(args: CloudapBuildArgs) -> Result<()> {
             if args.out_dir.is_some() || args.config.is_some() {
                 bail!("--out-dir/--config are only valid with --dir");
             }
-            build_one_cloudap_cache(wordlist, output, args.iterations, args.threads, args.fresh)
+            build_one_cloudap_cache(
+                wordlist,
+                output,
+                args.iterations,
+                args.threads,
+                args.fresh,
+                args.compact_cache,
+            )
         }
         (None, Some(dir)) => {
             if args.output.is_some() {
@@ -831,6 +841,7 @@ fn cmd_cloudap_build(args: CloudapBuildArgs) -> Result<()> {
                         args.iterations,
                         args.threads,
                         args.fresh,
+                        args.compact_cache,
                     )?;
                 }
                 tables.push(CloudapTableConfig {
@@ -866,6 +877,7 @@ fn build_one_cloudap_cache(
     iterations: u32,
     threads: usize,
     fresh: bool,
+    compact_cache: bool,
 ) -> Result<()> {
     let cuda_devices = cloudap_cuda_device_count().unwrap_or(0);
     let resolved = if cuda_devices > 0 { "cuda" } else { "cpu" };
@@ -875,15 +887,27 @@ fn build_one_cloudap_cache(
 
     let pb = cloudap_build_progress_bar();
     pb.set_message(format!("backend={resolved}"));
-    let stats = CloudapCache::build_with_backend(
-        dictionary,
-        cache,
-        iterations,
-        threads,
-        fresh,
-        CloudapBuildBackend::Auto,
-        Some(&pb),
-    )?;
+    let stats = if compact_cache {
+        CloudapCache::build_compact_with_backend(
+            dictionary,
+            cache,
+            iterations,
+            threads,
+            fresh,
+            CloudapBuildBackend::Auto,
+            Some(&pb),
+        )?
+    } else {
+        CloudapCache::build_with_backend(
+            dictionary,
+            cache,
+            iterations,
+            threads,
+            fresh,
+            CloudapBuildBackend::Auto,
+            Some(&pb),
+        )?
+    };
     pb.finish_and_clear();
     println!(
         "CloudAP cache complete [{}]: {} candidates ({} invalid UTF-8 line(s) skipped, {} resumed) -> {}",

@@ -8,6 +8,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod cloudap;
+mod cloudap_ordinal;
 mod index;
 mod oracle;
 

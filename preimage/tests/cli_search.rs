@@ -113,6 +113,52 @@ fn cloudap_build_auto_selects_backend_and_unified_search_finds_hashcat() {
 }
 
 #[test]
+fn compact_cloudap_v2_builds_sidecar_and_searches() {
+    let dir = tempdir().expect("tempdir");
+    let cache = dir.path().join("words-v2.cloudap33700.pim");
+    let dictionary = test_data("cloudap33700_words.txt");
+
+    let build = preimage()
+        .args([
+            "cloudap",
+            "build",
+            "-w",
+            dictionary.to_str().unwrap(),
+            "-o",
+            cache.to_str().unwrap(),
+            "--compact-cache",
+        ])
+        .output()
+        .expect("build compact CloudAP cache");
+    assert!(
+        build.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let mut sidecar = cache.as_os_str().to_os_string();
+    sidecar.push(".ord");
+    assert!(std::path::PathBuf::from(sidecar).exists());
+
+    let hit = preimage()
+        .args([
+            "search",
+            "-c",
+            cache.to_str().unwrap(),
+            "-d",
+            dictionary.to_str().unwrap(),
+            CLOUDAP_HASHCAT,
+        ])
+        .output()
+        .expect("search compact CloudAP cache");
+    assert!(
+        hit.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&hit.stderr)
+    );
+    assert!(stdout(&hit).contains("Password found: hashcat"));
+}
+
+#[test]
 fn default_search_config_supplies_algorithm_cache_and_dictionary() {
     let dir = tempdir().expect("tempdir");
     fs::copy(

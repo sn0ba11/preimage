@@ -91,24 +91,28 @@ Acceptance:
 ## Priority 1 — CloudAP PIM v2
 
 ### PRE-010: Define PIM v2 with 32-byte records
-Status: TODO
+Status: DONE
 Difficulty: Easy–Moderate
 
 Current PIM v1:
 - 32-byte derived key
 - 6-byte dictionary offset
 
-PIM v2:
+PIM v2 implemented:
+- version **2** in the existing 64-byte PIM header
 - 32-byte derived key only
-- candidate ordinal implied by record number
+- accepted-candidate ordinal implied by record number
+- v1/version 1 remains fully readable
 
 The current PIM file length is exactly consistent with **11,883,323,259 v1 records** after its 64-byte header: `(451,566,283,906 - 64) / 38`.
 
 That is **18,375,959 fewer PIM records than dictionary lines**. The current code path indicates invalid UTF-8 dictionary lines are skipped while empty valid-UTF8 lines are retained, so the working hypothesis is that this delta is the invalid-UTF8 set. Confirm this with whole-input accounting before relying on it. V2 must define ordinals over the accepted CloudAP candidate stream, not raw dictionary line number.
 
-If v2 represents the same 11,883,323,259 records at 32 bytes each, expected size is:
-- **380,266,344,352 bytes including the 64-byte header**
-- **354.15 GiB**
+At the production record count, PIM v2 size is projected as:
+- cache: **380,266,344,352 bytes including the 64-byte header**
+- ordinal sidecar (65,536-candidate stride): **2,901,280 bytes (~2.77 MiB)**
+- combined: **380,269,245,632 bytes**
+- cache alone: **354.15 GiB**
 
 Expected saving versus current PIM:
 - **71,299,939,554 bytes (~71.30 GB decimal)**
@@ -126,7 +130,7 @@ Acceptance:
 - No material scan slowdown; faster is expected on storage-bound systems.
 
 ### PRE-011: Candidate ordinal to plaintext lookup
-Status: TODO
+Status: DONE
 Difficulty: Moderate
 
 Implement a shared dictionary ordinal lookup so PIM v2 can map accepted-candidate ordinal N to the correct dictionary plaintext without storing a 6-byte offset in every record.
@@ -136,7 +140,15 @@ Preferred first implementation:
 - each checkpoint stores the corresponding dictionary byte offset
 - resolve candidate N by seeking to the nearest checkpoint and scanning forward while skipping invalid-UTF8 lines until ordinal N is reached
 
-Design the checkpoint format so it can later be reused or embedded by the seekable compressed-dictionary block table.
+Implemented sidecar:
+- sibling path: `<cache>.ord`
+- 64-byte header binding stride, dictionary length, SHA-256 and accepted-candidate count
+- 16-byte checkpoints: accepted-candidate ordinal + dictionary byte offset
+- default stride: **65,536 accepted candidates**
+- invalid-UTF8 lines are skipped during forward resolution
+- existing matching sidecars are reused; dictionary mismatch causes rebuild/refusal as appropriate
+
+The format is deliberately compatible with a future seekable compressed-dictionary block table.
 
 Acceptance:
 - Correct first/middle/last lookup.
@@ -145,7 +157,7 @@ Acceptance:
 - This path is not used during full PIM scans.
 
 ### PRE-012: PIM v2 build/resume support
-Status: TODO
+Status: IMPLEMENTED — CUDA hardware validation pending
 Difficulty: Moderate
 
 Adapt CPU and CUDA builders to emit v2 32-byte records.
@@ -158,11 +170,17 @@ Requirements:
 - Preserve progress/safety checks.
 - Treat process interruption, disk-full/write failure, publication failure and power-loss durability as separate failure cases.
 
-Acceptance:
-- CPU fresh build works.
-- CUDA fresh build works.
-- Interrupted build resumes.
-- `cloudap check` validates v2.
+Completed evidence:
+- CPU v2 fresh build works.
+- v2 build/scan correctly crosses invalid-UTF8 dictionary lines.
+- torn 32-byte partial records are repaired and resumed using the sidecar ordinal, not an embedded offset.
+- `CloudapCache::open/check/search` handle both v1 and v2.
+- CLI opt-in: `preimage cloudap build ... --compact-cache`.
+- full workspace suite passes **399 tests, zero failures** after adding CLI v2 coverage.
+- the existing conditional CUDA parity test now also compares v2 cache bytes and sidecar bytes, including a >64-byte UTF-16 HMAC key case.
+
+Remaining hardware gate:
+- execute the CUDA parity test on a CUDA-capable build/host; this checkout has no `nvcc`/CUDA runtime available.
 
 ### PRE-013: Benchmark PIM v2
 Status: TODO

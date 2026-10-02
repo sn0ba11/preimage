@@ -46,7 +46,7 @@ The core redesign is to make **candidate ordinal N** the identity of a dictionar
 
 This is especially natural for PIM because PIM records are created in dictionary order.
 
-## Design idea 2 — PIM v2: 32-byte records
+## Design idea 2 — PIM v2: 32-byte records — IMPLEMENTED
 
 Current PIM v1:
 
@@ -71,7 +71,7 @@ The production PIM is not a one-record-per-dictionary-line file. Its exact lengt
 
 That is **18,375,959 fewer records than the 11,901,699,218 dictionary lines**. The current CloudAP preparation code skips invalid-UTF8 lines and retains valid empty lines, so invalid UTF-8 is the leading explanation for the exact delta. This still needs whole-input confirmation because a resumed build's final log can report a total record count alongside an invocation-local invalid-UTF8 count.
 
-For the same 11,883,323,259 records, PIM v2 would be:
+For the same 11,883,323,259 records, implemented PIM v2 is:
 
 ```text
 64 + (11,883,323,259 × 32)
@@ -79,7 +79,7 @@ For the same 11,883,323,259 records, PIM v2 would be:
 = 354.15 GiB
 ```
 
-That removes **71,299,939,554 bytes (~71.30 GB decimal)** from the current PIM, around **15.8%**.
+The cache itself removes **71,299,939,554 bytes (~71.30 GB decimal)** from the current PIM, around **15.8%**. The implemented ordinal sidecar is projected at only **2,901,280 bytes (~2.77 MiB)** for the production record count, so combined v2 cache + sidecar is **380,269,245,632 bytes**.
 
 ### Why this should not hurt speed
 
@@ -91,14 +91,14 @@ Because PIM v2 reduces bytes read per candidate, it should be neutral or faster 
 
 No extra dictionary work is needed during a miss scan. Candidate-to-plaintext resolution only happens after a hit.
 
-## Design idea 3 — Sparse ordinal-to-byte lookup
+## Design idea 3 — Sparse ordinal-to-byte lookup — IMPLEMENTED
 
 Removing per-record offsets means Preimage needs a cheap way to recover dictionary text after a match.
 
-The first implementation should be simple:
+The implemented first version is intentionally simple:
 
 ```text
-checkpoint every K accepted CloudAP candidates:
+checkpoint every 65,536 accepted CloudAP candidates:
 (PIM record ordinal -> dictionary byte offset)
 ```
 
@@ -108,7 +108,7 @@ Resolution:
 3. scan forward, skipping invalid-UTF8 dictionary lines while counting accepted candidates
 4. return candidate N
 
-This avoids building another multi-billion-entry offset table.
+This avoids building another multi-billion-entry offset table. The sidecar uses a 64-byte dictionary-bound header and 16-byte checkpoints, stored as `<cache>.ord`.
 
 It is acceptable because plaintext resolution happens only after a candidate match and is therefore off the scan hot path.
 
@@ -241,7 +241,8 @@ This is a space/performance trade-off, not a correctness shortcut.
 The target is not guaranteed until real compression and succinct-index measurements are available, but the intended model is approximately:
 
 ```text
-PIM v2                     ~380.27 GB decimal
+PIM v2 cache               ~380.27 GB decimal
+PIM ordinal sidecar         ~0.003 GB decimal
 NTLM v2                    materially below current 166 GB
 compressed dictionary      measured ~27 GB with NTFS LZX (5:1); portable zstd-block result TBD
 small sidecars/metadata
