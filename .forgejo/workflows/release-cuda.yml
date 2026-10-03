@@ -57,20 +57,23 @@ jobs:
 
       - name: Publish Forgejo release
         if: startsWith(forgejo.ref, 'refs/tags/')
+        env:
+          HOST_CURL: /usr/bin/curl
+          HOST_PYTHON: /usr/bin/python3
         shell: bash
         run: |
           set -euo pipefail
           auth="Authorization: token $FORGEJO_TOKEN"
           release_url="http://192.168.224.2:3000/api/v1/repos/$FORGEJO_REPOSITORY/releases"
-          release_json="$(curl -fsS -H "$auth" "$release_url/tags/$FORGEJO_REF_NAME" 2>/dev/null || true)"
+          release_json="$("$HOST_CURL" -fsS -H "$auth" "$release_url/tags/$FORGEJO_REF_NAME" 2>/dev/null || true)"
           if [ -z "$release_json" ]; then
-            release_json="$(curl -fsS -H "$auth" -H 'Content-Type: application/json' -X POST \
+            release_json="$("$HOST_CURL" -fsS -H "$auth" -H 'Content-Type: application/json' -X POST \
               -d "{\"tag_name\":\"$FORGEJO_REF_NAME\",\"target_commitish\":\"$FORGEJO_SHA\",\"name\":\"Preimage $FORGEJO_REF_NAME\",\"body\":\"CUDA 13 Linux x86-64 build with CloudAP / Microsoft Online mode 33700 acceleration.\",\"draft\":false,\"prerelease\":false}" \
               "$release_url")"
           fi
-          release_id="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+          release_id="$(printf '%s' "$release_json" | "$HOST_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
           for asset in dist-cuda/preimage-linux-x86_64-cuda13.tar.gz dist-cuda/preimage-linux-x86_64-cuda13.tar.gz.sha256; do
             name="$(basename "$asset")"
-            curl -fsS -H "$auth" -X POST -F "attachment=@$asset" \
+            "$HOST_CURL" -fsS -H "$auth" -X POST -F "attachment=@$asset" \
               "$release_url/$release_id/assets?name=$name" >/dev/null
           done
