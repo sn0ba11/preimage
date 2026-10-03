@@ -18,7 +18,7 @@ jobs:
           set -euo pipefail
           git init .
           git remote remove origin 2>/dev/null || true
-          git remote add origin "http://forgejo:3000/${FORGEJO_REPOSITORY}.git"
+          git remote add origin "http://192.168.224.2:3000/${FORGEJO_REPOSITORY}.git"
           git fetch --depth 1 origin "${FORGEJO_SHA}"
           git checkout --detach FETCH_HEAD
 
