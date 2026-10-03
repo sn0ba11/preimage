@@ -12,10 +12,15 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Check out Preimage
-        uses: https://data.forgejo.org/actions/checkout@v6
-        with:
-          fetch-depth: 0
+      - name: Check out Preimage from local Forgejo
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git remote remove origin 2>/dev/null || true
+          git remote add origin "http://forgejo:3000/${FORGEJO_REPOSITORY}.git"
+          git fetch --depth 1 origin "${FORGEJO_SHA}"
+          git checkout --detach FETCH_HEAD
 
       - name: Build CUDA release
         shell: bash
