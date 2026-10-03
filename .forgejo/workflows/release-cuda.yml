@@ -62,7 +62,7 @@ jobs:
           set -euo pipefail
           release_json="$(wget -qO- --header="Authorization: token $FORGEJO_TOKEN" \
             "http://192.168.224.2:3000/api/v1/repos/$FORGEJO_REPOSITORY/releases/tags/$FORGEJO_REF_NAME")"
-          release_id="$(printf '%s' "$release_json" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)"
+          release_id="$(printf '%s' "$release_json" | grep -m1 -o '"id":[0-9]*' | cut -d: -f2)"
           test -n "$release_id"
           docker cp dist-cuda/preimage-linux-x86_64-cuda13.tar.gz forgejo:/tmp/preimage-linux-x86_64-cuda13.tar.gz
           docker cp dist-cuda/preimage-linux-x86_64-cuda13.tar.gz.sha256 forgejo:/tmp/preimage-linux-x86_64-cuda13.tar.gz.sha256
