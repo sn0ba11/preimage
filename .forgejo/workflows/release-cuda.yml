@@ -60,32 +60,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm \
-            --volumes-from forgejo-runner \
-            --network forgejo_default \
-            -e FORGEJO_TOKEN \
-            -e FORGEJO_API_URL \
-            -e FORGEJO_REPOSITORY \
-            -e FORGEJO_REF_NAME \
-            -e FORGEJO_SHA \
-            -w "$PWD" \
-            alpine:3.22 sh -lc '
-              set -euo pipefail
-              apk add --no-cache curl jq >/dev/null
-              auth="Authorization: token $FORGEJO_TOKEN"
-              release_url="$FORGEJO_API_URL/repos/$FORGEJO_REPOSITORY/releases"
-              release_json="$(curl -fsS -H "$auth" "$release_url/tags/$FORGEJO_REF_NAME" 2>/dev/null || true)"
-              if [ -z "$release_json" ]; then
-                payload="$(jq -nc \
-                  --arg tag "$FORGEJO_REF_NAME" \
-                  --arg sha "$FORGEJO_SHA" \
-                  "{tag_name:\$tag,target_commitish:\$sha,name:(\"Preimage \" + \$tag),body:\"CUDA 13 Linux x86-64 build with CloudAP / Microsoft Online mode 33700 acceleration. The build fails closed if nvcc is unavailable.\",draft:false,prerelease:false}")"
-                release_json="$(printf "%s" "$payload" | curl -fsS -H "$auth" -H "Content-Type: application/json" -X POST --data-binary @- "$release_url")"
-              fi
-              release_id="$(printf "%s" "$release_json" | jq -er ".id")"
-              for asset in dist-cuda/preimage-linux-x86_64-cuda13.tar.gz dist-cuda/preimage-linux-x86_64-cuda13.tar.gz.sha256; do
-                name="$(basename "$asset")"
-                curl -fsS -H "$auth" -X POST -F "attachment=@$asset" \
-                  "$release_url/$release_id/assets?name=$name" >/dev/null
-              done
-            '
+          auth="Authorization: token $FORGEJO_TOKEN"
+          release_url="http://192.168.224.2:3000/api/v1/repos/$FORGEJO_REPOSITORY/releases"
+          release_json="$(curl -fsS -H "$auth" "$release_url/tags/$FORGEJO_REF_NAME" 2>/dev/null || true)"
+          if [ -z "$release_json" ]; then
+            release_json="$(curl -fsS -H "$auth" -H 'Content-Type: application/json' -X POST \
+              -d "{\"tag_name\":\"$FORGEJO_REF_NAME\",\"target_commitish\":\"$FORGEJO_SHA\",\"name\":\"Preimage $FORGEJO_REF_NAME\",\"body\":\"CUDA 13 Linux x86-64 build with CloudAP / Microsoft Online mode 33700 acceleration.\",\"draft\":false,\"prerelease\":false}" \
+              "$release_url")"
+          fi
+          release_id="$(printf '%s' "$release_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+          for asset in dist-cuda/preimage-linux-x86_64-cuda13.tar.gz dist-cuda/preimage-linux-x86_64-cuda13.tar.gz.sha256; do
+            name="$(basename "$asset")"
+            curl -fsS -H "$auth" -X POST -F "attachment=@$asset" \
+              "$release_url/$release_id/assets?name=$name" >/dev/null
+          done
