@@ -1,6 +1,6 @@
 use std::path::Path;
 #[cfg(preimage_cuda)]
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex};
 
 use anyhow::{bail, Result};
 #[cfg(preimage_cuda)]
@@ -242,7 +242,9 @@ const WINDOW_BYTES: usize = 256 << 20;
 
 #[cfg(preimage_cuda)]
 const CUDA_SLOT_COUNT: usize = 32;
+#[cfg(preimage_cuda)]
 static CUDA_SLOT_USED: Mutex<[bool; CUDA_SLOT_COUNT]> = Mutex::new([false; CUDA_SLOT_COUNT]);
+#[cfg(preimage_cuda)]
 static CUDA_SLOT_AVAILABLE: Condvar = Condvar::new();
 
 #[cfg(preimage_cuda)]
@@ -263,6 +265,12 @@ fn release_cuda_slot(slot: usize) {
     used[slot] = false;
     CUDA_SLOT_AVAILABLE.notify_one();
 }
+
+#[cfg(not(preimage_cuda))]
+fn acquire_cuda_slot() -> usize { 0 }
+
+#[cfg(not(preimage_cuda))]
+fn release_cuda_slot(_slot: usize) {}
 
 /// The offset just past the first `\n` at or after `target`, or the end of `data` if
 /// there is none. Used to push a window or sub-range boundary onto a line boundary so
