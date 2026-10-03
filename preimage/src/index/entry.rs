@@ -242,10 +242,29 @@ impl IndexEntry {
                 unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, byte_len) };
             return writer.write_all(byte_slice);
         }
+
+        // Compact IDX2 cannot be reinterpreted directly because the canonical in-memory
+        // entry carries a sixth position byte. Serialize the whole batch into one dense
+        // buffer instead of issuing two write_all() syscalls per entry. At production
+        // scale the old path performed billions of tiny writes and dominated hashing.
+        let entry_size = HASH_PREFIX_LEN + format.position_len();
+        let mut bytes = Vec::with_capacity(count * entry_size);
         for entry in &buf[..count] {
-            entry.write_to_format(writer, format)?;
+            let position = entry.position();
+            if position > format.max_position() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "dictionary position {position} exceeds {}-byte index format maximum {}",
+                        format.position_len(),
+                        format.max_position()
+                    ),
+                ));
+            }
+            bytes.extend_from_slice(&entry.hash_prefix);
+            bytes.extend_from_slice(&entry.position[..format.position_len()]);
         }
-        Ok(())
+        writer.write_all(&bytes)
     }
 }
 

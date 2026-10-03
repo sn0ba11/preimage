@@ -183,7 +183,7 @@ Remaining hardware gate:
 - execute the CUDA parity test on a CUDA-capable build/host; this checkout has no `nvcc`/CUDA runtime available.
 
 ### PRE-013: Benchmark PIM v2
-Status: TODO
+Status: PARTIAL — Windows smoke benchmark complete; air-gapped Comino production benchmark pending
 Difficulty: Easy
 
 Compare v1 vs v2:
@@ -192,6 +192,27 @@ Compare v1 vs v2:
 - hit scan throughput
 - CPU usage
 - storage throughput
+
+Windows smoke evidence (2026-10-03, `windows-builder`, current source release build):
+- 3-candidate `cloudap33700_words.txt` fixture built successfully as both v1 and compact v2.
+- v1 cache: **178 bytes** = 64-byte header + 3 × 38-byte records.
+- v2 cache: **160 bytes** = 64-byte header + 3 × 32-byte records.
+- v2 ordinal sidecar: **80 bytes** for this tiny fixture; fixed metadata dominates at this scale and is negligible at production scale.
+- both `cloudap check` operations passed with dictionary binding verified.
+- five-process known-hit timings after first launch were approximately **6–7 ms** for both formats; this fixture is intentionally too small for throughput conclusions.
+- full Windows `cargo test --workspace --all-targets` passed **398 tests** with zero failures (262 + 3 + 73 + 12 + 5 + 19 + 24).
+
+This smoke benchmark validates the benchmark path and v1/v2 behavioural parity on Windows.
+
+Debian CPU-only evidence (2026-10-03, current source, Rust/Cargo 1.99 release build in a clean target directory):
+- generated a 100,001-candidate synthetic CloudAP dictionary and built both formats successfully with `backend=cpu (CUDA devices=0)`.
+- v1 cache: **3,800,102 bytes**; v2 cache: **3,200,096 bytes** plus **96-byte** ordinal sidecar.
+- raw cache reduction is exactly **600,006 bytes**, i.e. **6 bytes per candidate**; including the tiny sidecar the combined reduction is 599,910 bytes (~15.79%).
+- CPU build wall time was **9.405 s v1** and **11.291 s v2** in single runs; this is not treated as a regression measurement because build-order/system noise was not controlled.
+- five warm process-level known-hit and full-miss searches were approximately **7–12 ms v1** and **8–10 ms v2**. At a 3–4 MB cache size process/startup overhead dominates, but no material v2 scan penalty is visible.
+- Linux release test suite passed **399 tests** with zero failures (262 + 3 + 74 + 12 + 5 + 19 + 24).
+
+The Debian result confirms CPU-only v2 correctness, exact record-size reduction, sidecar operation, and scan parity on a moderate fixture. It does **not** satisfy the production performance gate: CPU usage, storage throughput, large full-miss throughput and the ~2-minute production baseline still require measurement on the air-gapped Comino dataset.
 
 Target:
 - ~15.8% raw reduction.
@@ -289,6 +310,38 @@ Acceptance:
 
 Remaining production gate:
 - benchmark lookup/sort throughput on production-scale IDX2 before making it the default
+
+### PRE-034: CUDA-accelerate NTLM/IDX generation
+Status: DONE — CUDA hardware validation passed on Sumuri
+Difficulty: Moderate
+
+Use the existing optional CUDA build path to accelerate NTLM index generation automatically when CUDA devices are present. CPU remains the fallback; there is no required backend flag.
+
+Implemented:
+- host parsing retains exact dictionary byte offsets, two-sided CR/LF trimming and invalid-UTF8 rejection semantics.
+- valid UTF-8 candidates are converted to UTF-16LE on the host and batched for GPU hashing.
+- CUDA kernel implements arbitrary-length, multi-block MD4 and returns full 16-byte NTLM digests; the existing index writer stores the required 8-byte prefix in either legacy IDX v1 or compact IDX2.
+- one line-aligned range is dispatched per visible CUDA device, so Comino's six GPUs can work concurrently while output is reassembled in dictionary order.
+- empty passwords and inputs longer than one MD4 block are supported.
+- `preimage create -a ntlm ...` auto-selects CUDA when compiled in and devices are visible, otherwise CPU, and reports the selected backend/device count.
+- non-NTLM algorithms remain on the existing CPU builder.
+- conditional CUDA test compares GPU entries byte-for-byte with CPU NTLM across ASCII, emoji, invalid UTF-8, empty and multi-block inputs.
+- CPU-only regression suite passes **399 tests** with zero failures after implementation.
+
+Hardware validation (Sumuri, 2026-10-03):
+- NVIDIA GeForce RTX 3070, driver 580.173.02, CUDA Toolkit 13.0 (`nvcc` V13.0.88), Rust/Cargo 1.99.0.
+- CUDA-required release build succeeded with `PREIMAGE_REQUIRE_CUDA=1`; the conditional CUDA parity test executed on device 0 and passed against CPU NTLM for ASCII, emoji/UTF-16, invalid UTF-8, empty and multi-block inputs.
+- A deterministic 2,000,000-candidate / 48,000,000-byte dictionary produced byte-identical unsorted compact IDX2 output on CPU and CUDA. Both files had SHA-256 `94f3990dd586362cfaf86c8ea151af0069d1e58e1ca20999e90692955e7e6fdf`; `cmp` passed.
+- Initial timings exposed a severe compact-IDX2 output bottleneck: 2M took CPU 3.25 s / CUDA 3.57 s; 50M took CPU 79.85 s / CUDA 85.62 s. IDX2 was issuing two tiny writes per entry.
+- IDX2 output now batch-serializes compact entries and performs one bulk write per worker range. On the same 50M / 1.2 GB fixture CPU fell to **1.42 s (~35.2M candidates/s)** and CUDA to 7.70 s.
+- CUDA now returns only the required 8-byte index prefix rather than the unused full 16-byte MD4 digest, cutting device output and D2H traffic; the RTX 3070 result improved to 6.90 s.
+- CUDA host preparation is now CPU-parallel even when only one GPU is present; prepared ranges are round-robin dispatched across visible GPUs. RTX 3070 time improved again to **2.55 s (~19.6M candidates/s)**.
+- Net improvement on the 50M fixture: CPU **56.2x faster** (79.85 -> 1.42 s); CUDA **33.6x faster** (85.62 -> 2.55 s). CPU and CUDA IDX2 output remains byte-identical with SHA-256 `6e8d3b16e9dcb04b9ac8b16cad84f6e5fb4db93385c1f932da1abb3b710bc2a9`.
+- Sumuri's CPU remains ~1.8x faster than its single RTX 3070 for this very cheap NTLM workload. The six-GPU Comino test is therefore the meaningful remaining CUDA throughput/scaling gate.
+- An initial parity run failed with CUDA OOM while the RTX 3070 had ~7.6/8 GiB VRAM occupied by other workloads. After freeing VRAM (5,961 MiB free), the same test passed. Production use should ensure sufficient free VRAM or add bounded batching/allocation handling if shared-GPU operation is required.
+
+Remaining production-scale performance gate:
+- benchmark the production-size NTLM build on Comino's six RTX 4090s before regenerating the 11.9-billion-candidate IDX2; record 1-GPU vs 6-GPU candidates/s and utilisation. This is a throughput/capacity gate, not a correctness gate for PRE-034.
 
 ### PRE-030: Remove per-entry dictionary byte offsets
 Status: TODO

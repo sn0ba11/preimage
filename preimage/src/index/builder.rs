@@ -1,6 +1,8 @@
 use std::path::Path;
 
 use anyhow::{bail, Result};
+#[cfg(preimage_cuda)]
+use anyhow::Context;
 use indicatif::ProgressBar;
 use memmap2::Mmap;
 
@@ -146,22 +148,56 @@ impl IndexBuilder {
         while wstart < n {
             let target = (wstart + WINDOW_BYTES).min(n);
             let wend = line_aligned_end(data, target);
-            let ranges = split_into_line_aligned_ranges(data, wstart, wend, threads);
+            let cuda_devices = if algorithm.name().eq_ignore_ascii_case("NTLM") {
+                ntlm_cuda_device_count()
+            } else {
+                0
+            };
+            let ranges = split_into_line_aligned_ranges(
+                data,
+                wstart,
+                wend,
+                // CUDA still needs substantial host work: parsing, UTF-8 validation,
+                // UTF-16LE packing and entry assembly. Keep that work CPU-parallel even
+                // when there are fewer GPUs.
+                threads,
+            );
 
-            let written = std::thread::scope(|scope| -> Result<u64> {
-                let handles: Vec<_> = ranges
-                    .iter()
-                    .map(|&(start, end)| scope.spawn(move || process_range(algorithm, data, start, end)))
-                    .collect();
+            let written = if cuda_devices > 0 {
+                std::thread::scope(|scope| -> Result<u64> {
+                    let handles: Vec<_> = ranges
+                        .iter()
+                        .enumerate()
+                        .map(|(worker, &(start, end))| {
+                            let device = worker % cuda_devices;
+                            scope.spawn(move || process_ntlm_cuda_range(data, start, end, device))
+                        })
+                        .collect();
 
-                let mut count = 0u64;
-                for handle in handles {
-                    let entries = handle.join().expect("hash worker panicked");
-                    IndexEntry::write_bulk_format(&mut output, &entries, entries.len(), format)?;
-                    count += entries.len() as u64;
-                }
-                Ok(count)
-            })?;
+                    let mut count = 0u64;
+                    for handle in handles {
+                        let entries = handle.join().expect("NTLM CUDA worker panicked")?;
+                        IndexEntry::write_bulk_format(&mut output, &entries, entries.len(), format)?;
+                        count += entries.len() as u64;
+                    }
+                    Ok(count)
+                })?
+            } else {
+                std::thread::scope(|scope| -> Result<u64> {
+                    let handles: Vec<_> = ranges
+                        .iter()
+                        .map(|&(start, end)| scope.spawn(move || process_range(algorithm, data, start, end)))
+                        .collect();
+
+                    let mut count = 0u64;
+                    for handle in handles {
+                        let entries = handle.join().expect("hash worker panicked");
+                        IndexEntry::write_bulk_format(&mut output, &entries, entries.len(), format)?;
+                        count += entries.len() as u64;
+                    }
+                    Ok(count)
+                })?
+            };
 
             entries_written += written;
             if let Some(pb) = progress {
@@ -249,6 +285,121 @@ fn process_range(algorithm: &dyn HashAlgorithm, data: &[u8], start: usize, end: 
     entries
 }
 
+fn ntlm_cuda_device_count() -> usize {
+    if !cfg!(preimage_cuda) {
+        return 0;
+    }
+    crate::cloudap::cloudap_cuda_device_count().unwrap_or(0)
+}
+
+fn process_ntlm_cuda_range(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    device: usize,
+) -> Result<Vec<IndexEntry>> {
+    let mut utf16 = Vec::new();
+    let mut offsets = Vec::new();
+    let mut lengths = Vec::new();
+    let mut dictionary_positions = Vec::new();
+    let mut pos = start;
+
+    while pos < end {
+        let (line_end, next) = match data[pos..end].iter().position(|&b| b == b'\n') {
+            Some(rel) => (pos + rel, pos + rel + 1),
+            None => (end, end),
+        };
+        let word = super::trim_record_separators(&data[pos..line_end]);
+        if let Ok(text) = std::str::from_utf8(word) {
+            offsets.push(utf16.len() as u64);
+            for unit in text.encode_utf16() {
+                utf16.extend_from_slice(&unit.to_le_bytes());
+            }
+            lengths.push(utf16.len() as u64 - offsets.last().copied().unwrap());
+            dictionary_positions.push(pos as u64);
+        }
+        pos = next;
+    }
+
+    if dictionary_positions.is_empty() {
+        return Ok(Vec::new());
+    }
+    // CUDA does not permit a useful zero-byte allocation. A range containing only
+    // empty passwords still has valid descriptors of length zero, so give the device
+    // a harmless byte to anchor those offsets.
+    if utf16.is_empty() {
+        utf16.push(0);
+    }
+    let digests = cuda_ntlm_md4(&utf16, &offsets, &lengths, device)?;
+    let mut entries = Vec::with_capacity(dictionary_positions.len());
+    for (i, position) in dictionary_positions.into_iter().enumerate() {
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&digests[i * 8..i * 8 + 8]);
+        entries.push(IndexEntry::new(prefix, position));
+    }
+    Ok(entries)
+}
+
+#[cfg(preimage_cuda)]
+fn cuda_ntlm_md4(
+    data: &[u8],
+    offsets: &[u64],
+    lengths: &[u64],
+    device: usize,
+) -> Result<Vec<u8>> {
+    use std::ffi::{c_char, c_int};
+    unsafe extern "C" {
+        fn preimage_ntlm_md4(
+            data: *const u8,
+            data_len: u64,
+            offsets: *const u64,
+            lengths: *const u64,
+            count: u64,
+            device: c_int,
+            outputs: *mut u8,
+            error: *mut c_char,
+            error_len: usize,
+        ) -> c_int;
+    }
+    let count = offsets.len();
+    if count != lengths.len() {
+        bail!("internal CUDA NTLM descriptor length mismatch");
+    }
+    let mut output = vec![0u8; count * 8];
+    let mut error = vec![0 as c_char; 512];
+    let device = c_int::try_from(device).context("CUDA device index does not fit c_int")?;
+    let status = unsafe {
+        preimage_ntlm_md4(
+            data.as_ptr(),
+            data.len() as u64,
+            offsets.as_ptr(),
+            lengths.as_ptr(),
+            count as u64,
+            device,
+            output.as_mut_ptr(),
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    if status != 0 {
+        let message = unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        bail!("CUDA NTLM failed on device {device}: {message}");
+    }
+    Ok(output)
+}
+
+#[cfg(not(preimage_cuda))]
+fn cuda_ntlm_md4(
+    _data: &[u8],
+    _offsets: &[u64],
+    _lengths: &[u64],
+    _device: usize,
+) -> Result<Vec<u8>> {
+    bail!("CUDA support is not present in this binary")
+}
+
 /// The 8-byte prefix stored for a word: the first 8 bytes of the digest, right-padded
 /// with zeros for shorter digests. `None` if the algorithm rejects the word.
 fn hash_prefix(algorithm: &dyn HashAlgorithm, word: &[u8]) -> Option<[u8; 8]> {
@@ -318,6 +469,22 @@ mod tests {
             .join("tests")
             .join("test_data")
             .join("words.txt")
+    }
+
+    #[cfg(preimage_cuda)]
+    #[test]
+    fn ntlm_cuda_is_byte_identical_to_cpu_when_a_device_is_available() {
+        if ntlm_cuda_device_count() == 0 {
+            return;
+        }
+        let data = b"password\nhello\n\xf0\x9f\x98\x80\n\xff\xfe\n\n                     this-password-is-deliberately-longer-than-one-md4-block-to-test-padding-and-multiblock-input-0123456789\n";
+        let gpu = process_ntlm_cuda_range(data, 0, data.len(), 0).expect("CUDA NTLM");
+        let cpu = process_range(&Ntlm, data, 0, data.len());
+        assert_eq!(gpu.len(), cpu.len());
+        for (gpu_entry, cpu_entry) in gpu.iter().zip(cpu.iter()) {
+            assert_eq!(gpu_entry.hash_prefix, cpu_entry.hash_prefix);
+            assert_eq!(gpu_entry.position(), cpu_entry.position());
+        }
     }
 
     #[test]

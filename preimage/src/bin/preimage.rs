@@ -419,6 +419,11 @@ fn create_one(
     output: &Path,
     compact_index: bool,
 ) -> Result<()> {
+    if algorithm.name().eq_ignore_ascii_case("NTLM") {
+        let cuda_devices = cloudap_cuda_device_count().unwrap_or(0);
+        let backend = if cuda_devices > 0 { "cuda" } else { "cpu" };
+        println!("NTLM build starting: backend={backend} (CUDA devices={cuda_devices})");
+    }
     let pb = create_progress_bar();
     let index = if compact_index {
         IndexFile::build_compact(algorithm, wordlist, output, Some(&pb))?
@@ -453,6 +458,11 @@ fn create_combined(
     println!("Concatenating into {} ...", dict_path.display());
     concatenate_files(files, dict_path)?;
 
+    if algorithm.name().eq_ignore_ascii_case("NTLM") {
+        let cuda_devices = cloudap_cuda_device_count().unwrap_or(0);
+        let backend = if cuda_devices > 0 { "cuda" } else { "cpu" };
+        println!("NTLM build starting: backend={backend} (CUDA devices={cuda_devices})");
+    }
     let pb = create_progress_bar();
     let index = if compact_index {
         IndexFile::build_compact(algorithm, dict_path, index_path, Some(&pb))?
@@ -513,6 +523,11 @@ fn create_separate(
             table.dictionary.display(),
             table.index.display()
         );
+        if algorithm.name().eq_ignore_ascii_case("NTLM") {
+            let cuda_devices = cloudap_cuda_device_count().unwrap_or(0);
+            let backend = if cuda_devices > 0 { "cuda" } else { "cpu" };
+            println!("NTLM build starting: backend={backend} (CUDA devices={cuda_devices})");
+        }
         let pb = create_progress_bar();
         if compact_index {
             IndexFile::build_compact(algorithm, &table.dictionary, &table.index, Some(&pb))?;
