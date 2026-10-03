@@ -278,33 +278,66 @@ __device__ void md4_compress(uint32_t state[4], const uint8_t block[64]) {
     #undef R3
 }
 
-__global__ void ntlm_md4_kernel(const uint8_t *data, const uint64_t *offsets,
-                                const uint64_t *lengths, uint8_t *outputs,
+__device__ __forceinline__ void md4_push_byte(uint32_t state[4], uint8_t block[64],
+                                               int &used, uint8_t value) {
+    block[used++]=value;
+    if (used==64) {
+        md4_compress(state,block);
+        used=0;
+    }
+}
+
+__device__ __forceinline__ void md4_push_utf16_unit(uint32_t state[4], uint8_t block[64],
+                                                     int &used, uint16_t unit) {
+    md4_push_byte(state,block,used,uint8_t(unit));
+    md4_push_byte(state,block,used,uint8_t(unit>>8));
+}
+
+__global__ void ntlm_md4_kernel(const uint8_t *data, const uint32_t *offsets,
+                                const uint32_t *lengths, uint8_t *outputs,
                                 uint64_t count) {
     uint64_t index=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;
     if (index>=count) return;
     const uint8_t *input=data+offsets[index];
-    uint64_t len=lengths[index];
+    const uint64_t len=lengths[index];
     uint32_t state[4]={0x67452301u,0xefcdab89u,0x98badcfeu,0x10325476u};
-    uint64_t full=len/64;
-    for (uint64_t i=0;i<full;++i) md4_compress(state,input+i*64);
     uint8_t block[64];
-    #pragma unroll
-    for (int i=0;i<64;++i) block[i]=0;
-    uint64_t rem=len%64;
-    for (uint64_t i=0;i<rem;++i) block[i]=input[full*64+i];
-    block[rem]=0x80;
-    if (rem>=56) {
-        md4_compress(state,block);
-        #pragma unroll
-        for (int i=0;i<64;++i) block[i]=0;
+    int used=0;
+    uint64_t utf16_bytes=0;
+
+    // Rust validates UTF-8 before descriptors reach this kernel. Decode each
+    // scalar directly on-device and feed its UTF-16LE representation into MD4,
+    // avoiding the large host-side UTF-16 packing buffer entirely.
+    for (uint64_t p=0;p<len;) {
+        uint32_t cp;
+        const uint8_t b0=input[p];
+        if (b0<0x80) { cp=b0; p+=1; }
+        else if ((b0&0xe0)==0xc0) {
+            cp=(uint32_t(b0&0x1f)<<6)|uint32_t(input[p+1]&0x3f); p+=2;
+        } else if ((b0&0xf0)==0xe0) {
+            cp=(uint32_t(b0&0x0f)<<12)|(uint32_t(input[p+1]&0x3f)<<6)|uint32_t(input[p+2]&0x3f); p+=3;
+        } else {
+            cp=(uint32_t(b0&0x07)<<18)|(uint32_t(input[p+1]&0x3f)<<12)|
+               (uint32_t(input[p+2]&0x3f)<<6)|uint32_t(input[p+3]&0x3f); p+=4;
+        }
+        if (cp<=0xffff) {
+            md4_push_utf16_unit(state,block,used,uint16_t(cp));
+            utf16_bytes+=2;
+        } else {
+            cp-=0x10000;
+            md4_push_utf16_unit(state,block,used,uint16_t(0xd800+(cp>>10)));
+            md4_push_utf16_unit(state,block,used,uint16_t(0xdc00+(cp&0x3ff)));
+            utf16_bytes+=4;
+        }
     }
-    uint64_t bits=len*8;
+
+    const uint64_t bits=utf16_bytes*8;
+    md4_push_byte(state,block,used,0x80);
+    while (used!=56) md4_push_byte(state,block,used,0);
     #pragma unroll
-    for (int i=0;i<8;++i) block[56+i]=uint8_t(bits>>(8*i));
-    md4_compress(state,block);
-    // IDX stores only the first 64 bits of the digest. Returning the unused
-    // second half doubles device writes and D2H traffic for no benefit.
+    for (int i=0;i<8;++i) md4_push_byte(state,block,used,uint8_t(bits>>(8*i)));
+
+    // IDX stores only the first 64 bits of the digest.
     #pragma unroll
     for (int i=0;i<2;++i) {
         outputs[index*8+i*4+0]=uint8_t(state[i]);
@@ -320,17 +353,26 @@ void set_error(char *error, size_t error_len, const char *operation, cudaError_t
 
 struct NtlmBuffers {
     uint8_t *data = nullptr;
-    uint64_t *offsets = nullptr;
-    uint64_t *lengths = nullptr;
+    uint32_t *offsets = nullptr;
+    uint32_t *lengths = nullptr;
     uint8_t *outputs = nullptr;
+    cudaStream_t stream = nullptr;
     size_t data_capacity = 0;
     size_t count_capacity = 0;
 };
 
 constexpr int MAX_NTLM_DEVICES = 32;
-NtlmBuffers ntlm_buffers[MAX_NTLM_DEVICES];
+constexpr int MAX_NTLM_SLOTS = 32;
+// One persistent allocation set per logical host worker. Workers may submit to
+// the same GPU concurrently without aliasing each other's buffers, while the
+// stable slot number lets allocations survive the per-window worker threads.
+NtlmBuffers ntlm_buffers[MAX_NTLM_DEVICES][MAX_NTLM_SLOTS];
 
 cudaError_t ensure_ntlm_buffers(NtlmBuffers &buffers, size_t data_bytes, size_t count) {
+    if (!buffers.stream) {
+        cudaError_t code = cudaStreamCreateWithFlags(&buffers.stream, cudaStreamNonBlocking);
+        if (code != cudaSuccess) return code;
+    }
     if (data_bytes > buffers.data_capacity) {
         uint8_t *replacement = nullptr;
         cudaError_t code = cudaMalloc(reinterpret_cast<void **>(&replacement), data_bytes);
@@ -340,9 +382,9 @@ cudaError_t ensure_ntlm_buffers(NtlmBuffers &buffers, size_t data_bytes, size_t 
         buffers.data_capacity = data_bytes;
     }
     if (count > buffers.count_capacity) {
-        uint64_t *new_offsets = nullptr, *new_lengths = nullptr;
+        uint32_t *new_offsets = nullptr, *new_lengths = nullptr;
         uint8_t *new_outputs = nullptr;
-        const size_t desc_bytes = count * sizeof(uint64_t);
+        const size_t desc_bytes = count * sizeof(uint32_t);
         const size_t output_bytes = count * 8;
         cudaError_t code = cudaMalloc(reinterpret_cast<void **>(&new_offsets), desc_bytes);
         if (code == cudaSuccess) code = cudaMalloc(reinterpret_cast<void **>(&new_lengths), desc_bytes);
@@ -373,33 +415,34 @@ extern "C" int preimage_cuda_device_count(int *count, char *error, size_t error_
 }
 
 extern "C" int preimage_ntlm_md4(const uint8_t *data, uint64_t data_len,
-                                  const uint64_t *offsets, const uint64_t *lengths,
-                                  uint64_t count, int device, uint8_t *outputs,
-                                  char *error, size_t error_len) {
-    if (!data || !offsets || !lengths || !outputs || !count || device < 0) {
+                                  const uint32_t *offsets, const uint32_t *lengths,
+                                  uint64_t count, int device, int slot,
+                                  uint8_t *outputs, char *error, size_t error_len) {
+    if (!data || !offsets || !lengths || !outputs || !count || device < 0 || slot < 0) {
         if (error && error_len) snprintf(error,error_len,"invalid CUDA NTLM arguments");
+        return -1;
+    }
+    if (device >= MAX_NTLM_DEVICES || slot >= MAX_NTLM_SLOTS) {
+        if (error && error_len) snprintf(error,error_len,"CUDA device or worker slot exceeds NTLM buffer table");
         return -1;
     }
     cudaError_t code=cudaSetDevice(device);
     if (code!=cudaSuccess) { set_error(error,error_len,"cudaSetDevice",code); return int(code); }
 
-    if (device >= MAX_NTLM_DEVICES) {
-        if (error && error_len) snprintf(error,error_len,"CUDA device index exceeds NTLM buffer table");
-        return -1;
-    }
-    NtlmBuffers &buffers = ntlm_buffers[device];
-    size_t desc_bytes=size_t(count)*sizeof(uint64_t), output_bytes=size_t(count)*8;
+    NtlmBuffers &buffers = ntlm_buffers[device][slot];
+    size_t desc_bytes=size_t(count)*sizeof(uint32_t), output_bytes=size_t(count)*8;
     code=ensure_ntlm_buffers(buffers,size_t(data_len),size_t(count));
-    if (code==cudaSuccess) code=cudaMemcpy(buffers.data,data,size_t(data_len),cudaMemcpyHostToDevice);
-    if (code==cudaSuccess) code=cudaMemcpy(buffers.offsets,offsets,desc_bytes,cudaMemcpyHostToDevice);
-    if (code==cudaSuccess) code=cudaMemcpy(buffers.lengths,lengths,desc_bytes,cudaMemcpyHostToDevice);
+    if (code==cudaSuccess) code=cudaMemcpyAsync(buffers.data,data,size_t(data_len),cudaMemcpyHostToDevice,buffers.stream);
+    if (code==cudaSuccess) code=cudaMemcpyAsync(buffers.offsets,offsets,desc_bytes,cudaMemcpyHostToDevice,buffers.stream);
+    if (code==cudaSuccess) code=cudaMemcpyAsync(buffers.lengths,lengths,desc_bytes,cudaMemcpyHostToDevice,buffers.stream);
     if (code==cudaSuccess) {
         const int threads=128;
         const unsigned blocks=unsigned((count+threads-1)/threads);
-        ntlm_md4_kernel<<<blocks,threads>>>(buffers.data,buffers.offsets,buffers.lengths,buffers.outputs,count);
+        ntlm_md4_kernel<<<blocks,threads,0,buffers.stream>>>(buffers.data,buffers.offsets,buffers.lengths,buffers.outputs,count);
         code=cudaGetLastError();
     }
-    if (code==cudaSuccess) code=cudaMemcpy(outputs,buffers.outputs,output_bytes,cudaMemcpyDeviceToHost);
+    if (code==cudaSuccess) code=cudaMemcpyAsync(outputs,buffers.outputs,output_bytes,cudaMemcpyDeviceToHost,buffers.stream);
+    if (code==cudaSuccess) code=cudaStreamSynchronize(buffers.stream);
     if (code!=cudaSuccess) { set_error(error,error_len,"NTLM CUDA kernel",code); return int(code); }
     return 0;
 }

@@ -1,4 +1,6 @@
 use std::path::Path;
+#[cfg(preimage_cuda)]
+use std::sync::{Condvar, Mutex, OnceLock};
 
 use anyhow::{bail, Result};
 #[cfg(preimage_cuda)]
@@ -148,7 +150,9 @@ impl IndexBuilder {
         while wstart < n {
             let target = (wstart + WINDOW_BYTES).min(n);
             let wend = line_aligned_end(data, target);
-            let cuda_devices = if algorithm.name().eq_ignore_ascii_case("NTLM") {
+            let cuda_devices = if algorithm.name().eq_ignore_ascii_case("NTLM")
+                && std::env::var_os("PREIMAGE_FORCE_CPU").is_none()
+            {
                 ntlm_cuda_device_count()
             } else {
                 0
@@ -170,15 +174,33 @@ impl IndexBuilder {
                         .enumerate()
                         .map(|(worker, &(start, end))| {
                             let device = worker % cuda_devices;
-                            scope.spawn(move || process_ntlm_cuda_range(data, start, end, device))
+                            let slot = acquire_cuda_slot();
+                            scope.spawn(move || {
+                                let result = process_ntlm_cuda_range(data, start, end, device, slot);
+                                release_cuda_slot(slot);
+                                result
+                            })
                         })
                         .collect();
 
                     let mut count = 0u64;
                     for handle in handles {
-                        let entries = handle.join().expect("NTLM CUDA worker panicked")?;
-                        IndexEntry::write_bulk_format(&mut output, &entries, entries.len(), format)?;
-                        count += entries.len() as u64;
+                        let (digests, positions) = handle.join().expect("NTLM CUDA worker panicked")?;
+                        if format == IndexFormat::LegacyV1 {
+                            let entries: Vec<_> = positions
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &position)| {
+                                    let mut prefix = [0u8; 8];
+                                    prefix.copy_from_slice(&digests[i * 8..i * 8 + 8]);
+                                    IndexEntry::new(prefix, position)
+                                })
+                                .collect();
+                            IndexEntry::write_bulk_format(&mut output, &entries, entries.len(), format)?;
+                        } else {
+                            IndexEntry::write_compact_parts(&mut output, &digests, &positions, format)?;
+                        }
+                        count += positions.len() as u64;
                     }
                     Ok(count)
                 })?
@@ -216,7 +238,31 @@ impl IndexBuilder {
 /// between the parallel phase and the ordered write; smaller ones bound the entries
 /// held in memory at once. Windows are line-aligned, so a single line longer than this
 /// still ends up whole in one window.
-const WINDOW_BYTES: usize = 128 << 20;
+const WINDOW_BYTES: usize = 256 << 20;
+
+#[cfg(preimage_cuda)]
+const CUDA_SLOT_COUNT: usize = 32;
+static CUDA_SLOT_USED: Mutex<[bool; CUDA_SLOT_COUNT]> = Mutex::new([false; CUDA_SLOT_COUNT]);
+static CUDA_SLOT_AVAILABLE: Condvar = Condvar::new();
+
+#[cfg(preimage_cuda)]
+fn acquire_cuda_slot() -> usize {
+    let mut used = CUDA_SLOT_USED.lock().expect("CUDA slot pool poisoned");
+    loop {
+        if let Some(slot) = used.iter().position(|busy| !*busy) {
+            used[slot] = true;
+            return slot;
+        }
+        used = CUDA_SLOT_AVAILABLE.wait(used).expect("CUDA slot pool poisoned");
+    }
+}
+
+#[cfg(preimage_cuda)]
+fn release_cuda_slot(slot: usize) {
+    let mut used = CUDA_SLOT_USED.lock().expect("CUDA slot pool poisoned");
+    used[slot] = false;
+    CUDA_SLOT_AVAILABLE.notify_one();
+}
 
 /// The offset just past the first `\n` at or after `target`, or the end of `data` if
 /// there is none. Used to push a window or sub-range boundary onto a line boundary so
@@ -297,10 +343,12 @@ fn process_ntlm_cuda_range(
     start: usize,
     end: usize,
     device: usize,
-) -> Result<Vec<IndexEntry>> {
-    let mut utf16 = Vec::new();
-    let mut offsets = Vec::new();
-    let mut lengths = Vec::new();
+    slot: usize,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    // Keep descriptors compact on the host. A window is at most 256 MiB, so
+    // offsets/lengths fit comfortably in u32 and halve descriptor traffic.
+    let mut offsets: Vec<u32> = Vec::new();
+    let mut lengths: Vec<u32> = Vec::new();
     let mut dictionary_positions = Vec::new();
     let mut pos = start;
 
@@ -310,52 +358,42 @@ fn process_ntlm_cuda_range(
             None => (end, end),
         };
         let word = super::trim_record_separators(&data[pos..line_end]);
-        if let Ok(text) = std::str::from_utf8(word) {
-            offsets.push(utf16.len() as u64);
-            for unit in text.encode_utf16() {
-                utf16.extend_from_slice(&unit.to_le_bytes());
-            }
-            lengths.push(utf16.len() as u64 - offsets.last().copied().unwrap());
+        if std::str::from_utf8(word).is_ok() {
+            let word_start = word.as_ptr() as usize - data.as_ptr() as usize;
+            offsets.push((word_start - start) as u32);
+            lengths.push(word.len() as u32);
             dictionary_positions.push(pos as u64);
         }
         pos = next;
     }
 
     if dictionary_positions.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
-    // CUDA does not permit a useful zero-byte allocation. A range containing only
-    // empty passwords still has valid descriptors of length zero, so give the device
-    // a harmless byte to anchor those offsets.
-    if utf16.is_empty() {
-        utf16.push(0);
-    }
-    let digests = cuda_ntlm_md4(&utf16, &offsets, &lengths, device)?;
-    let mut entries = Vec::with_capacity(dictionary_positions.len());
-    for (i, position) in dictionary_positions.into_iter().enumerate() {
-        let mut prefix = [0u8; 8];
-        prefix.copy_from_slice(&digests[i * 8..i * 8 + 8]);
-        entries.push(IndexEntry::new(prefix, position));
-    }
-    Ok(entries)
+    // Pass the original UTF-8 range directly. The CUDA kernel performs UTF-8 to
+    // UTF-16LE conversion while feeding MD4, eliminating host packing and its copy.
+    let digests = cuda_ntlm_md4(&data[start..end], &offsets, &lengths, device, slot)?;
+    Ok((digests, dictionary_positions))
 }
 
 #[cfg(preimage_cuda)]
 fn cuda_ntlm_md4(
     data: &[u8],
-    offsets: &[u64],
-    lengths: &[u64],
+    offsets: &[u32],
+    lengths: &[u32],
     device: usize,
+    slot: usize,
 ) -> Result<Vec<u8>> {
     use std::ffi::{c_char, c_int};
     unsafe extern "C" {
         fn preimage_ntlm_md4(
             data: *const u8,
             data_len: u64,
-            offsets: *const u64,
-            lengths: *const u64,
+            offsets: *const u32,
+            lengths: *const u32,
             count: u64,
             device: c_int,
+            slot: c_int,
             outputs: *mut u8,
             error: *mut c_char,
             error_len: usize,
@@ -368,6 +406,7 @@ fn cuda_ntlm_md4(
     let mut output = vec![0u8; count * 8];
     let mut error = vec![0 as c_char; 512];
     let device = c_int::try_from(device).context("CUDA device index does not fit c_int")?;
+    let slot = c_int::try_from(slot).context("CUDA worker slot does not fit c_int")?;
     let status = unsafe {
         preimage_ntlm_md4(
             data.as_ptr(),
@@ -376,6 +415,7 @@ fn cuda_ntlm_md4(
             lengths.as_ptr(),
             count as u64,
             device,
+            slot,
             output.as_mut_ptr(),
             error.as_mut_ptr(),
             error.len(),
@@ -393,9 +433,10 @@ fn cuda_ntlm_md4(
 #[cfg(not(preimage_cuda))]
 fn cuda_ntlm_md4(
     _data: &[u8],
-    _offsets: &[u64],
-    _lengths: &[u64],
+    _offsets: &[u32],
+    _lengths: &[u32],
     _device: usize,
+    _slot: usize,
 ) -> Result<Vec<u8>> {
     bail!("CUDA support is not present in this binary")
 }
@@ -478,12 +519,15 @@ mod tests {
             return;
         }
         let data = b"password\nhello\n\xf0\x9f\x98\x80\n\xff\xfe\n\n                     this-password-is-deliberately-longer-than-one-md4-block-to-test-padding-and-multiblock-input-0123456789\n";
-        let gpu = process_ntlm_cuda_range(data, 0, data.len(), 0).expect("CUDA NTLM");
+        let slot = acquire_cuda_slot();
+        let result = process_ntlm_cuda_range(data, 0, data.len(), 0, slot);
+        release_cuda_slot(slot);
+        let (digests, positions) = result.expect("CUDA NTLM");
         let cpu = process_range(&Ntlm, data, 0, data.len());
-        assert_eq!(gpu.len(), cpu.len());
-        for (gpu_entry, cpu_entry) in gpu.iter().zip(cpu.iter()) {
-            assert_eq!(gpu_entry.hash_prefix, cpu_entry.hash_prefix);
-            assert_eq!(gpu_entry.position(), cpu_entry.position());
+        assert_eq!(positions.len(), cpu.len());
+        for (i, cpu_entry) in cpu.iter().enumerate() {
+            assert_eq!(&digests[i * 8..i * 8 + 8], &cpu_entry.hash_prefix);
+            assert_eq!(positions[i], cpu_entry.position());
         }
     }
 

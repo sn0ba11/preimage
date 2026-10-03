@@ -217,6 +217,30 @@ impl IndexEntry {
         Ok(())
     }
 
+    pub fn write_compact_parts(
+        writer: &mut impl Write,
+        digests: &[u8],
+        positions: &[u64],
+        format: IndexFormat,
+    ) -> std::io::Result<()> {
+        assert_ne!(format, IndexFormat::LegacyV1);
+        assert_eq!(digests.len(), positions.len() * HASH_PREFIX_LEN);
+        let entry_size = HASH_PREFIX_LEN + format.position_len();
+        let mut bytes = Vec::with_capacity(positions.len() * entry_size);
+        for (digest, &position) in digests.chunks_exact(HASH_PREFIX_LEN).zip(positions) {
+            if position > format.max_position() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("dictionary position {position} exceeds {}-byte index format maximum {}", format.position_len(), format.max_position()),
+                ));
+            }
+            bytes.extend_from_slice(digest);
+            let encoded = position.to_le_bytes();
+            bytes.extend_from_slice(&encoded[..format.position_len()]);
+        }
+        writer.write_all(&bytes)
+    }
+
     pub fn write_bulk_format(
         writer: &mut impl Write,
         buf: &[Self],
