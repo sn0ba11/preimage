@@ -110,7 +110,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $output = Join-Path $PWD 'dist\windows-builder'
           $installers = @(
-            Get-ChildItem -LiteralPath $output -File -Recurse |
+            Get-ChildItem -LiteralPath $output -File |
               Where-Object { $_.Extension.ToLowerInvariant() -in @('.exe', '.msi', '.msix', '.msixbundle') }
           )
           if ($installers.Count -eq 0) {
@@ -137,7 +137,7 @@ jobs:
           }
 
           $artifacts = @(
-            Get-ChildItem -LiteralPath $output -File -Recurse |
+            Get-ChildItem -LiteralPath $output -File |
               Where-Object {
                 $_.Extension.ToLowerInvariant() -in @('.exe', '.msi', '.msix', '.msixbundle', '.zip', '.json') -or
                 $_.Name.EndsWith('.sha256', [StringComparison]::OrdinalIgnoreCase)
@@ -170,7 +170,7 @@ jobs:
             Set-Content -LiteralPath (Join-Path $output 'windows-builder-provenance.json') -Encoding utf8
 
           Write-Host 'Build products:'
-          Get-ChildItem -LiteralPath $output -File -Recurse |
+          Get-ChildItem -LiteralPath $output -File |
             ForEach-Object { Write-Host ("  {0} ({1} bytes)" -f $_.Name, $_.Length) }
 
       - name: Publish Forgejo release
@@ -225,7 +225,7 @@ jobs:
 
           $output = Join-Path $PWD 'dist\windows-builder'
           $files = @(
-            Get-ChildItem -LiteralPath $output -File -Recurse |
+            Get-ChildItem -LiteralPath $output -File |
               Where-Object {
                 $_.Extension.ToLowerInvariant() -in @('.exe', '.msi', '.msix', '.msixbundle', '.zip', '.json') -or
                 $_.Name.EndsWith('.sha256', [StringComparison]::OrdinalIgnoreCase)
