@@ -1,0 +1,242 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish build products to a Forgejo release
+        required: false
+        type: boolean
+        default: true
+      release_kind:
+        description: Release kind (test, prerelease, release)
+        required: false
+        type: string
+        default: prerelease
+
+jobs:
+  build-windows-installer:
+    runs-on: windows-builder
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $workspace = $env:FORGEJO_WORKSPACE
+          if ([string]::IsNullOrWhiteSpace($workspace)) {
+            throw 'FORGEJO_WORKSPACE is not defined.'
+          }
+          New-Item -ItemType Directory -Force -Path $workspace | Out-Null
+          Set-Location $workspace
+
+          Get-ChildItem -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction Stop
+
+          git init .
+          git remote add origin "$($env:FORGEJO_SERVER_URL)/$($env:FORGEJO_REPOSITORY).git"
+
+          $basic = [Convert]::ToBase64String(
+            [Text.Encoding]::ASCII.GetBytes("x-access-token:$($env:FORGEJO_TOKEN)")
+          )
+          $env:GIT_CONFIG_COUNT = '1'
+          $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
+          $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          try {
+            git fetch --no-tags --depth 1 origin $env:FORGEJO_REF
+            if ($LASTEXITCODE -ne 0) { throw "git fetch failed with exit code $LASTEXITCODE." }
+            git checkout --detach $env:FORGEJO_SHA
+            if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE." }
+          } finally {
+            Remove-Item Env:GIT_CONFIG_COUNT -ErrorAction SilentlyContinue
+            Remove-Item Env:GIT_CONFIG_KEY_0 -ErrorAction SilentlyContinue
+            Remove-Item Env:GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue
+          }
+
+      - name: Verify WindowsBuilder
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:FORGEJO_ACTIONS) {
+            throw 'This workflow must run under Forgejo Actions.'
+          }
+          $runner = Get-Service ForgejoRunner -ErrorAction Stop
+          if ($runner.Status -ne 'Running') {
+            throw 'ForgejoRunner service is not running.'
+          }
+          Write-Host "Runner: $env:COMPUTERNAME"
+          Write-Host "Repository: $env:FORGEJO_REPOSITORY"
+          Write-Host "Commit: $env:FORGEJO_SHA"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $PWD 'dist\windows-builder'
+          Remove-Item -LiteralPath $output -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          $env:WINDOWS_BUILD_OUTPUT = $output
+
+          $candidates = @(
+            '.forgejo\windows-build.ps1',
+            'build\windows.ps1',
+            'scripts\build-windows.ps1',
+            'packaging\windows\build.ps1'
+          )
+          $entrypoint = $null
+          foreach ($candidate in $candidates) {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+              $entrypoint = (Resolve-Path -LiteralPath $candidate).Path
+              break
+            }
+          }
+          if (-not $entrypoint) {
+            throw ('No Windows build entrypoint found. Add one of: ' + ($candidates -join ', ') + '. The script must write build products to $env:WINDOWS_BUILD_OUTPUT.')
+          }
+
+          Write-Host "Build entrypoint: $entrypoint"
+          & $entrypoint
+          if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+            throw "Windows build entrypoint failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Verify and describe build products
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $PWD 'dist\windows-builder'
+          $installers = @(
+            Get-ChildItem -LiteralPath $output -File -Recurse |
+              Where-Object { $_.Extension.ToLowerInvariant() -in @('.exe', '.msi', '.msix', '.msixbundle') }
+          )
+          if ($installers.Count -eq 0) {
+            throw "No Windows installer was produced under $output."
+          }
+
+          foreach ($installer in $installers) {
+            if ($installer.Extension -ieq '.exe') {
+              $stream = [IO.File]::OpenRead($installer.FullName)
+              try {
+                if ($stream.ReadByte() -ne 0x4d -or $stream.ReadByte() -ne 0x5a) {
+                  throw "$($installer.Name) is not a PE executable."
+                }
+              } finally {
+                $stream.Dispose()
+              }
+            }
+
+            $sidecar = "$($installer.FullName).sha256"
+            if (-not (Test-Path -LiteralPath $sidecar -PathType Leaf)) {
+              $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $($installer.Name)" | Set-Content -LiteralPath $sidecar -Encoding ascii -NoNewline
+            }
+          }
+
+          $artifacts = @(
+            Get-ChildItem -LiteralPath $output -File -Recurse |
+              Where-Object {
+                $_.Extension.ToLowerInvariant() -in @('.exe', '.msi', '.msix', '.msixbundle', '.zip', '.json') -or
+                $_.Name.EndsWith('.sha256', [StringComparison]::OrdinalIgnoreCase)
+              }
+          )
+          if ($artifacts.Count -eq 0) {
+            throw 'No publishable build products were found.'
+          }
+
+          $provenance = [ordered]@{
+            schema_version = 1
+            repository = $env:FORGEJO_REPOSITORY
+            commit = $env:FORGEJO_SHA
+            ref = $env:FORGEJO_REF
+            run_id = $env:FORGEJO_RUN_ID
+            run_number = $env:FORGEJO_RUN_NUMBER
+            built_at_utc = [DateTime]::UtcNow.ToString('o')
+            runner = $env:COMPUTERNAME
+            artifacts = @(
+              $artifacts | ForEach-Object {
+                [ordered]@{
+                  name = $_.Name
+                  size = $_.Length
+                  sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                }
+              }
+            )
+          }
+          $provenance | ConvertTo-Json -Depth 6 |
+            Set-Content -LiteralPath (Join-Path $output 'windows-builder-provenance.json') -Encoding utf8
+
+          Write-Host 'Build products:'
+          Get-ChildItem -LiteralPath $output -File -Recurse |
+            ForEach-Object { Write-Host ("  {0} ({1} bytes)" -f $_.Name, $_.Length) }
+
+      - name: Publish Forgejo release
+        if: ${{ inputs.publish }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kind = '${{ inputs.release_kind }}'.Trim().ToLowerInvariant()
+          if ($kind -notin @('test', 'prerelease', 'release')) {
+            throw "Invalid release_kind '$kind'. Expected test, prerelease or release."
+          }
+
+          $shortSha = $env:FORGEJO_SHA.Substring(0, 12)
+          if ($env:FORGEJO_REF -like 'refs/tags/*') {
+            $tag = $env:FORGEJO_REF_NAME
+          } else {
+            $tag = "build-$($env:FORGEJO_RUN_NUMBER)-$shortSha"
+          }
+          $isPrerelease = $kind -ne 'release'
+          $releaseName = "$($env:FORGEJO_REPOSITORY) Windows build $tag"
+          $api = "$($env:FORGEJO_SERVER_URL)/api/v1/repos/$($env:FORGEJO_REPOSITORY)"
+          $headers = @{ Authorization = "token $env:FORGEJO_TOKEN" }
+
+          $release = $null
+          try {
+            $release = Invoke-RestMethod -Method Get -Uri "$api/releases/tags/$tag" -Headers $headers
+          } catch {
+            if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+          }
+
+          if (-not $release) {
+            $body = @{
+              tag_name = $tag
+              target_commitish = $env:FORGEJO_SHA
+              name = $releaseName
+              body = "WindowsBuilder run $($env:FORGEJO_RUN_ID) for commit $($env:FORGEJO_SHA)."
+              draft = $false
+              prerelease = $isPrerelease
+            } | ConvertTo-Json
+            $release = Invoke-RestMethod -Method Post -Uri "$api/releases" -Headers $headers -ContentType 'application/json' -Body $body
+          } else {
+            $body = @{
+              tag_name = $tag
+              target_commitish = $env:FORGEJO_SHA
+              name = $releaseName
+              body = "WindowsBuilder run $($env:FORGEJO_RUN_ID) for commit $($env:FORGEJO_SHA)."
+              draft = $false
+              prerelease = $isPrerelease
+            } | ConvertTo-Json
+            $release = Invoke-RestMethod -Method Patch -Uri "$api/releases/$($release.id)" -Headers $headers -ContentType 'application/json' -Body $body
+          }
+
+          $output = Join-Path $PWD 'dist\windows-builder'
+          $files = @(
+            Get-ChildItem -LiteralPath $output -File -Recurse |
+              Where-Object {
+                $_.Extension.ToLowerInvariant() -in @('.exe', '.msi', '.msix', '.msixbundle', '.zip', '.json') -or
+                $_.Name.EndsWith('.sha256', [StringComparison]::OrdinalIgnoreCase)
+              }
+          )
+
+          foreach ($file in $files) {
+            $existing = @($release.assets | Where-Object { $_.name -eq $file.Name })
+            foreach ($asset in $existing) {
+              Invoke-RestMethod -Method Delete -Uri "$api/releases/$($release.id)/assets/$($asset.id)" -Headers $headers | Out-Null
+            }
+            Write-Host "Publishing $($file.Name)"
+            Invoke-RestMethod -Method Post -Uri "$api/releases/$($release.id)/assets?name=$([uri]::EscapeDataString($file.Name))" -Headers $headers -Form @{ attachment = $file } | Out-Null
+            $release = Invoke-RestMethod -Method Get -Uri "$api/releases/$($release.id)" -Headers $headers
+          }
+
+          Write-Host "Published release: $tag"
