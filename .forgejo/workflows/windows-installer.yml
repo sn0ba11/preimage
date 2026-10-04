@@ -44,10 +44,13 @@ jobs:
           $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
           $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
           try {
-            git fetch --no-tags --depth 1 origin $env:FORGEJO_REF
+            git fetch --no-tags --depth 1 origin $env:FORGEJO_SHA
             if ($LASTEXITCODE -ne 0) { throw "git fetch failed with exit code $LASTEXITCODE." }
-            git checkout --detach $env:FORGEJO_SHA
+            git checkout --detach FETCH_HEAD
             if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE." }
+            if ((git rev-parse HEAD).Trim() -ne $env:FORGEJO_SHA) {
+              throw "Checked out commit does not match FORGEJO_SHA."
+            }
           } finally {
             Remove-Item Env:GIT_CONFIG_COUNT -ErrorAction SilentlyContinue
             Remove-Item Env:GIT_CONFIG_KEY_0 -ErrorAction SilentlyContinue
