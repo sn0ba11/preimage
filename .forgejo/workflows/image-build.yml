@@ -1,0 +1,163 @@
+name: Build IMG or ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish build products to a Forgejo release
+        required: false
+        type: boolean
+        default: true
+      release_kind:
+        description: Release kind (test, prerelease, release)
+        required: false
+        type: string
+        default: prerelease
+
+concurrency:
+  group: image-build-${{ forgejo.repository }}-${{ forgejo.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-image:
+    runs-on: docker
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace="${FORGEJO_WORKSPACE:?FORGEJO_WORKSPACE is not defined}"
+          mkdir -p "$workspace"
+          cd "$workspace"
+          find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          git init .
+          git remote add origin "$FORGEJO_SERVER_URL/$FORGEJO_REPOSITORY.git"
+          basic="$(printf 'x-access-token:%s' "$FORGEJO_TOKEN" | base64 -w0)"
+          git -c "http.extraHeader=Authorization: Basic $basic" fetch --no-tags --depth 1 origin "$FORGEJO_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$FORGEJO_SHA"
+
+      - name: Build IMG/ISO
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$PWD/dist/image-builder"
+          rm -rf "$output"
+          mkdir -p "$output"
+          export IMAGE_BUILD_OUTPUT="$output"
+
+          entrypoint=""
+          for candidate in             .forgejo/image-build.sh             .forgejo/iso-build.sh             build/image.sh             build/iso.sh             scripts/build-image.sh             scripts/build-iso.sh             packaging/image/build.sh
+          do
+            if [[ -f "$candidate" ]]; then
+              entrypoint="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$entrypoint" ]]; then
+            echo "No IMG/ISO build entrypoint found." >&2
+            echo "The script must write final files to \$IMAGE_BUILD_OUTPUT." >&2
+            exit 1
+          fi
+
+          chmod +x "$entrypoint"
+          echo "Build entrypoint: $entrypoint"
+          "$entrypoint"
+
+      - name: Verify build products
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$PWD/dist/image-builder"
+          shopt -s nullglob
+          products=("$output"/*.img "$output"/*.iso "$output"/*.img.gz "$output"/*.img.xz "$output"/*.img.zst "$output"/*.iso.gz "$output"/*.iso.xz "$output"/*.iso.zst)
+          if (( ${#products[@]} == 0 )); then
+            echo "No IMG/ISO product was produced under $output." >&2
+            exit 1
+          fi
+
+          for file in "${products[@]}"; do
+            if [[ ! -f "$file.sha256" ]]; then
+              (cd "$output" && sha256sum "$(basename "$file")" > "$(basename "$file").sha256")
+            fi
+          done
+
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          out = Path("dist/image-builder")
+          items = []
+          for p in sorted(out.iterdir()):
+              if p.is_file():
+                  items.append({
+                      "name": p.name,
+                      "size": p.stat().st_size,
+                      "sha256": hashlib.sha256(p.read_bytes()).hexdigest(),
+                  })
+          provenance = {
+              "schema_version": 1,
+              "repository": os.environ.get("FORGEJO_REPOSITORY"),
+              "commit": os.environ.get("FORGEJO_SHA"),
+              "ref": os.environ.get("FORGEJO_REF"),
+              "run_id": os.environ.get("FORGEJO_RUN_ID"),
+              "run_number": os.environ.get("FORGEJO_RUN_NUMBER"),
+              "runner": os.uname().nodename,
+              "artifacts": items,
+          }
+          (out / "image-builder-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+          PY
+
+          ls -lh "$output"
+
+      - name: Publish Forgejo release
+        if: ${{ inputs.publish }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          kind='${{ inputs.release_kind }}'
+          case "$kind" in
+            test|prerelease|release) ;;
+            *) echo "Invalid release_kind '$kind'." >&2; exit 1 ;;
+          esac
+
+          short_sha="${FORGEJO_SHA:0:12}"
+          if [[ "$FORGEJO_REF" == refs/tags/* ]]; then
+            tag="$FORGEJO_REF_NAME"
+          else
+            tag="image-${FORGEJO_RUN_NUMBER}-${short_sha}"
+          fi
+
+          prerelease=true
+          [[ "$kind" == release ]] && prerelease=false
+          api="$FORGEJO_SERVER_URL/api/v1/repos/$FORGEJO_REPOSITORY"
+          auth=(-H "Authorization: token $FORGEJO_TOKEN")
+          status="$(curl -ksS -o /tmp/release.json -w '%{http_code}' "${auth[@]}" "$api/releases/tags/$tag")"
+
+          body="$(jq -nc             --arg tag "$tag"             --arg commit "$FORGEJO_SHA"             --arg name "$FORGEJO_REPOSITORY image build $tag"             --arg run "$FORGEJO_RUN_ID"             --argjson prerelease "$prerelease"             '{tag_name:$tag,target_commitish:$commit,name:$name,body:("ImageBuilder run " + $run + " for commit " + $commit + "."),draft:false,prerelease:$prerelease}')"
+
+          if [[ "$status" == 404 ]]; then
+            curl -kfsS "${auth[@]}" -H 'Content-Type: application/json' -d "$body" "$api/releases" > /tmp/release.json
+          elif [[ "$status" == 200 ]]; then
+            id="$(jq -r .id /tmp/release.json)"
+            curl -kfsS "${auth[@]}" -X PATCH -H 'Content-Type: application/json' -d "$body" "$api/releases/$id" > /tmp/release.json
+          else
+            echo "Forgejo release lookup failed with HTTP $status" >&2
+            exit 1
+          fi
+
+          id="$(jq -r .id /tmp/release.json)"
+          for file in dist/image-builder/*; do
+            [[ -f "$file" ]] || continue
+            name="$(basename "$file")"
+            while IFS= read -r asset_id; do
+              [[ -n "$asset_id" ]] && curl -kfsS "${auth[@]}" -X DELETE "$api/releases/$id/assets/$asset_id" >/dev/null
+            done < <(jq -r --arg n "$name" '.assets[]? | select(.name==$n) | .id' /tmp/release.json)
+            echo "Publishing $name"
+            curl -kfsS "${auth[@]}" -X POST -F "attachment=@$file" "$api/releases/$id/assets?name=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$name")" >/dev/null
+            curl -kfsS "${auth[@]}" "$api/releases/$id" > /tmp/release.json
+          done
+
+          echo "Published release: $tag"
