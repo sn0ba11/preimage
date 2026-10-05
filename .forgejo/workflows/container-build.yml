@@ -1,0 +1,94 @@
+name: Build Container Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Push image(s) to the Forgejo container registry
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: container-build-${{ forgejo.repository }}-${{ forgejo.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-container:
+    runs-on: docker
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace="${FORGEJO_WORKSPACE:?FORGEJO_WORKSPACE is not defined}"
+          mkdir -p "$workspace"
+          cd "$workspace"
+          find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          git init .
+          git remote add origin "$FORGEJO_SERVER_URL/$FORGEJO_REPOSITORY.git"
+          basic="$(printf 'x-access-token:%s' "$FORGEJO_TOKEN" | base64 -w0)"
+          git -c "http.extraHeader=Authorization: Basic $basic" fetch --no-tags --depth 1 origin "$FORGEJO_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$FORGEJO_SHA"
+
+      - name: Build container image(s)
+        shell: bash
+        env:
+          CONTAINER_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          registry="${FORGEJO_SERVER_URL#https://}"
+          registry="${registry#http://}"
+          export CONTAINER_REGISTRY="$registry"
+          export CONTAINER_REPOSITORY="$FORGEJO_REPOSITORY"
+          export CONTAINER_SHA_TAG="sha-${FORGEJO_SHA:0:12}"
+
+          if [[ "$CONTAINER_PUBLISH" == "true" ]]; then
+            printf '%s' "$FORGEJO_TOKEN" | docker login "$CONTAINER_REGISTRY" -u "$FORGEJO_ACTOR" --password-stdin
+          fi
+
+          entrypoint=""
+          for candidate in             .forgejo/container-build.sh             build/container.sh             scripts/build-container.sh             packaging/container/build.sh
+          do
+            if [[ -f "$candidate" ]]; then
+              entrypoint="$candidate"
+              break
+            fi
+          done
+
+          if [[ -n "$entrypoint" ]]; then
+            chmod +x "$entrypoint"
+            echo "Build entrypoint: $entrypoint"
+            "$entrypoint"
+            exit 0
+          fi
+
+          if [[ ! -f Dockerfile ]]; then
+            echo "No container build entrypoint or root Dockerfile found." >&2
+            echo "Add .forgejo/container-build.sh for multi-image/Compose projects." >&2
+            exit 1
+          fi
+
+          owner="${FORGEJO_REPOSITORY%%/*}"
+          repo="${FORGEJO_REPOSITORY##*/}"
+          image="$CONTAINER_REGISTRY/$owner/$repo"
+          docker build --pull=false -t "$image:$CONTAINER_SHA_TAG" .
+          docker tag "$image:$CONTAINER_SHA_TAG" "$image:latest"
+
+          if [[ "$CONTAINER_PUBLISH" == "true" ]]; then
+            docker push "$image:$CONTAINER_SHA_TAG"
+            docker push "$image:latest"
+          fi
+
+          printf '%s\n' "$image:$CONTAINER_SHA_TAG" "$image:latest"
+
+      - name: Log out from registry
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          registry="${FORGEJO_SERVER_URL#https://}"
+          registry="${registry#http://}"
+          docker logout "$registry" >/dev/null 2>&1 || true
