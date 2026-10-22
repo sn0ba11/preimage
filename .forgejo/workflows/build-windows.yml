@@ -1,0 +1,84 @@
+name: Build Preimage Windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'preimage-build-*'
+
+jobs:
+  windows:
+    name: Windows x64 release build
+    runs-on: windows-builder
+    timeout-minutes: 90
+    steps:
+      - name: Checkout requested commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git init .
+          git remote add origin "$($env:FORGEJO_SERVER_URL)/$($env:FORGEJO_REPOSITORY).git"
+          $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$($env:FORGEJO_TOKEN)"))
+          $env:GIT_CONFIG_COUNT = '1'
+          $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
+          $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          try {
+            git fetch --no-tags --depth 1 origin $env:FORGEJO_SHA
+            if ($LASTEXITCODE -ne 0) { throw 'Git fetch failed' }
+            git checkout --detach FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { throw 'Git checkout failed' }
+            if ((git rev-parse HEAD).Trim() -ne $env:FORGEJO_SHA) { throw 'Checkout SHA mismatch' }
+          } finally {
+            Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue
+          }
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            $installer = Join-Path $env:RUNNER_TEMP 'rustup-init.exe'
+            Invoke-WebRequest 'https://win.rustup.rs/x86_64' -OutFile $installer
+            & $installer -y --profile minimal --default-host x86_64-pc-windows-msvc
+            if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed' }
+          }
+          $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          rustup default stable-x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain configuration failed' }
+          cargo --version
+          rustc --version
+
+      - name: Test and build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          cargo test --workspace --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
+          cargo build --release --locked -p preimage
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+
+      - name: Package executable and checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'target\release\preimage.exe'
+          if (-not (Test-Path $exe)) { throw 'Release executable missing' }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $exe dist\preimage.exe
+          Copy-Item README.md,LICENSE-MIT,LICENSE-APACHE dist\
+          $sha = (git rev-parse --short=12 HEAD).Trim()
+          $archive = "preimage-windows-x64-$sha.zip"
+          Compress-Archive -Path dist\preimage.exe,dist\README.md,dist\LICENSE-MIT,dist\LICENSE-APACHE -DestinationPath $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content -Encoding ascii "$archive.sha256"
+          Write-Host "Built $archive from $env:FORGEJO_SHA"
+
+      - name: Upload Windows build
+        uses: https://data.forgejo.org/actions/upload-artifact@v3
+        with:
+          name: preimage-windows-x64
+          path: |
+            preimage-windows-x64-*.zip
+            preimage-windows-x64-*.zip.sha256
+          if-no-files-found: error
