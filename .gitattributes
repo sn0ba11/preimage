@@ -1,0 +1,4 @@
+# Reference indexes store byte offsets into the original LF-only wordlist.
+# Git must never rewrite line endings of these byte-addressed test fixtures.
+preimage/tests/test_data/words.txt -text
+preimage/tests/test_data/*.idx -text
