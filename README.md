@@ -85,7 +85,7 @@ and the tested lookups returned identical results.
 Install this fork's CLI with:
 
 ```bash
-cargo install --git https://github.com/briangillan/preimage preimage
+cargo install --git https://github.com/sn0ba11/preimage preimage
 ```
 
 ## How it works
