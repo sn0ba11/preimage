@@ -49,7 +49,7 @@ Results:
 Conclusion:
 - PIM/IDX contain mostly high-entropy cryptographic material, so binary-cache format redesign is still useful
 - the dictionary compresses extremely well
-- the completed LZX result means the Windows SpectreDemo deployment is already close to the target; the easy v2 reductions may be sufficient without requiring the most aggressive succinct-index design
+- the completed LZX result means the Windows deployment is already close to the target; the easy v2 reductions may be sufficient without requiring the most aggressive succinct-index design
 
 ## Important performance baseline
 

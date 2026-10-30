@@ -330,7 +330,7 @@ example, one billion candidates require about 38 GB (35.4 GiB) of cache data.
 Lines that are not valid UTF-8 are skipped and counted because the CloudAP KDF is
 defined here over the Unicode password encoded as UTF-16LE.
 
-### Search a Spectre 33700 target
+### Search a CloudAP 33700 target
 
 The same `preimage search` command is used for ordinary indexes and CloudAP caches.
 CloudAP targets are detected automatically from the `$MSONLINEACCOUNT$0$...` prefix.
@@ -342,7 +342,7 @@ preimage search -c words.cloudap33700.pim -d words.txt \
   '$MSONLINEACCOUNT$0$10000$...'
 ```
 
-Folder config, using Spectre's exported `.hash` file directly:
+Folder config, using a saved `.hash` target file:
 
 ```bash
 preimage search \

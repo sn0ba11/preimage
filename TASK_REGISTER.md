@@ -275,7 +275,7 @@ Measured:
 - Dictionary ≈ **5:1**
 - Whole dataset ≈ **1.4:1**, **550,005,972,992 bytes** allocated
 
-LZX is a SpectreDemo deployment optimisation only, not the canonical Preimage format.
+LZX is a Windows deployment optimisation only, not the canonical Preimage format.
 
 ## Priority 3 — NTLM index v2
 
@@ -471,7 +471,7 @@ Requirements:
 - mixed or incomplete generations are detected before use
 - rollback selects one complete prior generation
 
-### PRE-044: SpectreDemo packaging
+### PRE-044: Windows packaging
 Status: TODO
 Difficulty: Moderate
 

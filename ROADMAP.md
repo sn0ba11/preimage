@@ -30,7 +30,7 @@ That is expected:
 
 Therefore the binary-cache savings must come mainly from **changing what is stored**, while the dictionary can benefit strongly from deployment-level or portable block compression. The completed Windows LZX result saves **204,218,720,847 bytes (~204.22 GB)** and leaves only **50,005,972,992 bytes (~50.01 GB)** to remove to reach the <500 GB decimal target.
 
-VHDX can still be useful for SpectreDemo packaging, mounting and portability on Windows, but VHDX by itself does not meaningfully compress these files.
+VHDX can still be useful for packaging, mounting and portability on Windows, but VHDX by itself does not meaningfully compress these files.
 
 ## Design idea 1 — Candidate ordinal as the canonical identity
 
@@ -282,13 +282,13 @@ Key current reference:
 
 For external USB HDD deployment, smaller files may provide an even larger practical benefit because the disk, not CPU, becomes the bottleneck.
 
-## Deployment note — SpectreDemo
+## Deployment note — Windows
 
 A Windows VHDX remains useful as a packaging mechanism:
 - one portable data container
 - easy mount/unmount
 - optional read-only mounting
-- convenient SpectreDemo distribution
+- convenient Windows distribution
 
 But:
 - VHDX is not the primary compression strategy
